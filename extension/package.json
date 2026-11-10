@@ -1,0 +1,11 @@
+{
+  "name": "AseLaps",
+  "displayName": "AseLaps",
+  "description": "Canvas timelapse recording with independent edit history.",
+  "version": "1.2.0",
+  "publisher": "AseLaps",
+  "categories": ["Scripts"],
+  "contributes": {
+    "scripts": [{ "path": "./init.lua" }]
+  }
+}
