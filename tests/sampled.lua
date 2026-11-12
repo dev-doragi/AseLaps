@@ -44,7 +44,15 @@ if app.params.ffmpeg then
   for _, format in ipairs({"MP4","GIF"}) do
     options.format=format
     options.background="White"
-    E.run(store,session,options)
+    local loadSnapshot,writeImage=S.loadSnapshot,S.writeImage
+    S.loadSnapshot=function() error("Video export must not decode RGBA in Aseprite") end
+    S.writeImage=function() error("Video export must not create intermediate PNGs") end
+    local outputs=E.run(store,session,options)
+    S.loadSnapshot,S.writeImage=loadSnapshot,writeImage
+    assert(app.fs.fileSize(outputs[1])>0)
+    for _,path in ipairs(app.fs.listFiles(app.fs.filePath(outputs[1]))) do
+      assert(not path:match("%.png$") and not path:match("%.ffconcat$"),path)
+    end
     E.run(store,legacy,options)
   end
 end

@@ -1,0 +1,96 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+
+public static class AseLapsRawEncoder
+{
+    private static string Quote(string argument)
+    {
+        StringBuilder quoted = new StringBuilder("\"");
+        int backslashes = 0;
+        foreach (char character in argument)
+        {
+            if (character == '\\')
+            {
+                backslashes++;
+                continue;
+            }
+            if (character == '"')
+            {
+                quoted.Append('\\', backslashes * 2 + 1);
+            }
+            else
+            {
+                quoted.Append('\\', backslashes);
+            }
+            quoted.Append(character);
+            backslashes = 0;
+        }
+        quoted.Append('\\', backslashes * 2);
+        quoted.Append('"');
+        return quoted.ToString();
+    }
+
+    public static int Run(string executable, string[] arguments, string[] sources,
+        long frameBytes, string log)
+    {
+        StringBuilder command = new StringBuilder();
+        foreach (string argument in arguments)
+        {
+            if (command.Length > 0)
+                command.Append(' ');
+            command.Append(Quote(argument));
+        }
+        ProcessStartInfo start = new ProcessStartInfo(executable, command.ToString());
+        start.UseShellExecute = false;
+        start.CreateNoWindow = true;
+        start.RedirectStandardInput = true;
+        start.RedirectStandardError = true;
+        using (Process process = Process.Start(start))
+        {
+            Task<string> errors = process.StandardError.ReadToEndAsync();
+            Exception inputError = null;
+            try
+            {
+                Stream input = process.StandardInput.BaseStream;
+                foreach (string source in sources)
+                {
+                    using (FileStream frame = File.OpenRead(source))
+                    {
+                        if (frame.Length != frameBytes)
+                            throw new InvalidDataException("Incomplete RGBA snapshot: " + source);
+                        frame.CopyTo(input);
+                    }
+                }
+            }
+            catch (Exception error)
+            {
+                inputError = error;
+            }
+            finally
+            {
+                try
+                {
+                    process.StandardInput.Close();
+                }
+                catch (IOException error)
+                {
+                    if (inputError == null)
+                        inputError = error;
+                }
+            }
+            process.WaitForExit();
+            string messages = errors.GetAwaiter().GetResult();
+            if (inputError != null)
+                messages += Environment.NewLine + inputError;
+            File.WriteAllText(log, messages);
+            if (process.ExitCode != 0)
+                return process.ExitCode;
+            if (inputError != null)
+                throw new IOException("Could not stream RGBA snapshots. Log: " + log, inputError);
+            return 0;
+        }
+    }
+}

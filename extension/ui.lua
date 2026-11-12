@@ -97,7 +97,7 @@ end
 
 function Ui:show()
   if self.main then return end
-  local dlg = Dialog{ title="AseLaps 1.2.0", resizeable=false, onclose=function() self.main = nil end }
+  local dlg = Dialog{ title="AseLaps 1.2.1", resizeable=false, onclose=function() self.main = nil end }
   self.main, self.labels, self.enabled = dlg, {}, {}
   dlg:label{ id="project", label="Document", text="-" }
   dlg:label{ id="canvas", label="Canvas", text="-" }

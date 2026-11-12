@@ -11,6 +11,11 @@ switch ($Action) {
     'export' {
         $executable = [string]$request.executable
         $ffArgs = [string[]]$request.arguments
+        if ($request.sources) {
+            Add-Type -Path (Join-Path $PSScriptRoot 'RawEncoder.cs')
+            exit [AseLapsRawEncoder]::Run($executable, $ffArgs, [string[]]$request.sources,
+                [long]$request.frameBytes, [string]$request.log)
+        }
         $ErrorActionPreference = 'Continue'
         $global:LASTEXITCODE = 1
         & $executable @ffArgs 2>&1 | Out-File -Encoding UTF8 -LiteralPath $request.log -ErrorAction Stop

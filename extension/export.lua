@@ -130,26 +130,33 @@ local function encode(store, session, frames, folder, geometry, options)
   local pending = join(folder, "timelapse.pending." .. ext)
   local output = join(folder, "timelapse." .. ext)
   local log = join(folder, "ffmpeg.log")
-  local converted = {}
   local ok, err = pcall(function()
+    local sources
+    local args = {"-hide_banner", "-nostdin", "-n", "-loglevel", "warning", "-xerror"}
+    local function add(...)
+      for _, value in ipairs({...}) do args[#args + 1] = value end
+    end
     if session.info.version == 2 then
+      assert(session.info.rowStride == session.info.captureWidth * 4, "Unexpected RGBA row stride.")
+      sources = {}
       for _, id in ipairs(frames) do
-        if not converted[id] then
-          local path = join(folder, string.format("source_%06d.png", id))
-          converted[id] = path
-          store.writeImage(store.loadSnapshot(session, id), path)
-        end
+        sources[#sources + 1] = store.snapshotPath(session, id)
       end
+      add("-f", "rawvideo", "-pixel_format", "rgba", "-video_size",
+        string.format("%dx%d", session.info.captureWidth, session.info.captureHeight),
+        "-framerate", tostring(options.fps), "-i", "pipe:0")
+    else
+      local lines = {"ffconcat version 1.0\n"}
+      local frameRate = "\noption framerate " .. options.fps .. "\n"
+      for _, id in ipairs(frames) do
+        local source = store.png(session, id):gsub("\\", "/"):gsub("'", "'\\''")
+        lines[#lines + 1] = "file '" .. source .. "'" .. frameRate
+      end
+      store.writeText(manifest, table.concat(lines))
+      add("-f", "concat", "-safe", "0", "-protocol_whitelist", "file", "-i", manifest)
     end
-    local lines = {"ffconcat version 1.0\n"}
-    local frameRate = "\noption framerate " .. options.fps .. "\n"
-    for _, id in ipairs(frames) do
-      local source = (converted[id] or store.png(session, id)):gsub("\\", "/"):gsub("'", "'\\''")
-      lines[#lines + 1] = "file '" .. source .. "'" .. frameRate
-    end
-    store.writeText(manifest, table.concat(lines))
 
-    -- Use one timestamp per selected PNG, including repeated Undo/Redo images.
+    -- Use one timestamp per selected frame, including repeated Undo/Redo images.
     local filters = string.format(
       "[0:v]settb=1/%d,setpts=N,format=rgba,scale=%d:%d:flags=neighbor",
       options.fps, geometry.width, geometry.height)
@@ -169,14 +176,7 @@ local function encode(store, session, frames, folder, geometry, options)
       filters = filters .. ",split[a][b];[a]palettegen=reserve_transparent=" ..
         (transparent and "1" or "0") .. "[p];[b][p]paletteuse=dither=none"
     end
-    local args = {
-      "-hide_banner", "-nostdin", "-n", "-loglevel", "warning", "-xerror",
-      "-f", "concat", "-safe", "0", "-protocol_whitelist", "file", "-i", manifest,
-      "-filter_complex_threads", "1", "-filter_complex", filters .. "[out]", "-map", "[out]"
-    }
-    local function add(...)
-      for _, value in ipairs({...}) do args[#args + 1] = value end
-    end
+    add("-filter_complex_threads", "1", "-filter_complex", filters .. "[out]", "-map", "[out]")
     if ext == "mp4" then
       add("-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
         "-movflags", "+faststart")
@@ -187,7 +187,8 @@ local function encode(store, session, frames, folder, geometry, options)
     end
     add(pending)
     local success, code = runHelper(store, "export", {
-      executable=options.ffmpeg, arguments=args, log=log
+      executable=options.ffmpeg, arguments=args, log=log, sources=sources,
+      frameBytes=session.info.rowStride and session.info.rowStride * session.info.captureHeight
     })
     assert(success, string.format("FFmpeg failed (%s). Log: %s", tostring(code), log))
     assert(fs.isFile(pending) and fs.fileSize(pending) > 0, "No video produced. Log: " .. log)
@@ -199,7 +200,6 @@ local function encode(store, session, frames, folder, geometry, options)
       print("AseLaps: temporary export data could not be removed: " .. path)
     end
   end
-  for _, path in pairs(converted) do remove(path) end
   remove(manifest)
   if not ok then
     remove(pending)
