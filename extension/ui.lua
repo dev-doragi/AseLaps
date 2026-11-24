@@ -1,6 +1,8 @@
 local fs = app.fs
 local Ui = {}
 Ui.__index = Ui
+-- build.ps1 replaces this token using package.json; source runs remain labelled development.
+Ui.version="@ASELAPS_VERSION@"
 
 function Ui.new(recorder, export, preferences)
   return setmetatable({ recorder=recorder, export=export, preferences=preferences }, Ui)
@@ -16,8 +18,56 @@ end
 
 function Ui:attempt(action)
   local ok, result = pcall(action)
-  if not ok then app.alert{ title="AseLaps", text=tostring(result) } end
+  if not ok then self:showError(result) end
   return ok, result
+end
+
+function Ui:showError(message)
+  local detail=tostring(message)
+  local brief=detail:gsub("^.-:%d+: ","")
+  if app.alert{title="AseLaps",text=brief,buttons={"OK","Details"}}==2 then
+    app.alert{title="AseLaps error details",text=detail}
+  end
+end
+
+function Ui:runTask(title,work)
+  assert(not self.task,"Wait for the current task to finish.")
+  local control={cancelled=false}
+  local finished,result,problem=false,nil,nil
+  local dlg=Dialog{title=title,onclose=function() if not finished then control.cancelled=true end end}
+  dlg:label{id="progress",text="Starting..."}
+  dlg:button{id="cancel",text="Cancel",onclick=function()
+    control.cancelled=true
+    dlg:modify{id="cancel",enabled=false}
+    dlg:modify{id="progress",text="Cancelling safely..."}
+  end}
+  local task=coroutine.create(function() return work(control) end)
+  local timer
+  timer=Timer{interval=0.02,ontick=function()
+    timer:stop()
+    local ok,value
+    local started=os.clock()
+    for _=1,16 do
+      ok,value=coroutine.resume(task)
+      if not ok or coroutine.status(task)=="dead" or os.clock()-started>=0.008
+        or (value and (value.phase=="Encoding" or value.phase=="Cancelling encoder")) then break end
+    end
+    if not ok or coroutine.status(task)=="dead" then
+      finished=true
+      if ok then result=value else problem=value end
+      dlg:close()
+    else
+      if value then dlg:modify{id="progress",text=string.format("%s: %d / %d",value.phase,value.done or 0,value.total or 0)} end
+      timer:start()
+    end
+  end}
+  self.task={control=control,timer=timer}
+  timer:start()
+  repeat dlg:show{autoscrollbars=true} until finished
+  timer:stop()
+  self.task=nil
+  if problem and not control.cancelled then error(problem,0) end
+  return result
 end
 
 function Ui:document()
@@ -91,7 +141,10 @@ function Ui:refresh()
   end
   label("count", last)
   label("selected", selected and projectLabel(selected) or "-")
-  label("notice", self.notice or (selected and selected.recovered and "Recovered to the last valid record.") or "")
+  local hint=""
+  if not sprite then hint="Open artwork, save it, then choose New Recording."
+  elseif not sprite.hasAssociatedFile then hint="Save this artwork before starting a recording." end
+  label("notice", self.notice or (selected and selected.recovered and "Recovered to the last valid record. Original data is preserved.") or hint)
   local function enable(id, value)
     value = not not value
     if self.enabled[id] ~= value then
@@ -100,7 +153,7 @@ function Ui:refresh()
     end
   end
   local resumable = session and session.info.version >= 2 and (session.faulted or session.history.status ~= "stopped")
-  enable("start", doc and not doc.running and not resumable)
+  enable("start", doc and sprite.hasAssociatedFile and not doc.running and not resumable)
   enable("pause", doc and doc.running)
   enable("resume", resumable and not doc.running)
   enable("stop", resumable)
@@ -111,8 +164,10 @@ function Ui:refresh()
 end
 
 function Ui:show()
-  if self.main then return end
-  local dlg = Dialog{ title="AseLaps 2.1.2", resizeable=false, onclose=function() self.main = nil end }
+  if self.main then self.main:close() end
+  local version=Ui.version
+  if version:sub(1,1)=="@" then version="development" end
+  local dlg = Dialog{ title="AseLaps "..version, resizeable=false, onclose=function() self.main = nil end }
   self.main, self.labels, self.enabled = dlg, {}, {}
   dlg:label{ id="project", label="Document", text="-" }
   dlg:label{ id="canvas", label="Canvas", text="-" }
@@ -124,7 +179,7 @@ function Ui:show()
     self:record(function(doc)
       self.selected, self.notice = nil, nil
       assert(doc.sprite.hasAssociatedFile, "Save the artwork before recording.")
-      local root = fs.joinPath(self.recorder.store.recordingRoot(), fs.fileTitle(doc.sprite.filename) .. "__record")
+      local root = fs.joinPath(self.recorder.store:recordingFolder(), fs.fileTitle(doc.sprite.filename) .. "__record")
       local selected = self:pickFile("New recording: choose session location", fs.joinPath(root, os.date("%Y%m%d_%H%M%S") .. ".json"), true, {"json"})
       if not selected then return end
       local folder = fs.joinPath(fs.filePath(selected), fs.fileTitle(selected))
@@ -149,7 +204,7 @@ function Ui:show()
     self:record(function(doc) self.recorder:capture(doc, false, true) end)
   end }
   dlg:button{ text="Hide", onclick=function() dlg:close() end }
-  dlg:label{ text="Recording continues when this panel is closed." }
+  dlg:label{ text="Pause: resume later. Stop: finish this session. Hide: keep recording." }
   dlg:separator{ text="Review and export" }
   dlg:label{ id="selected", label="Selected session", text="-" }
   dlg:button{ text="Open Session...", onclick=function() self:attempt(function() self:sessions() end) end }
@@ -158,18 +213,17 @@ function Ui:show()
       local session=assert(self:session(),"Open a session first.")
       local doc=assert(self:document(),"Open the artwork to resume recording.")
       assert(not doc.running,"Pause the current recording first.")
+      self.recorder:canResume(doc,session)
       if session.info.version < 4 then
         assert(doc.sprite.width==session.info.width and doc.sprite.height==session.info.height,"Canvas size differs from this session.")
       end
       if self.recorder.store.source(doc.sprite)~=session.project.source then
         assert(app.alert{title="Link artwork",text="Resume this session with the current artwork?",buttons={"Resume","Cancel"}}==1,"Resume cancelled.")
       end
-      doc.session=session
-      doc.project=session.project
-      doc.project.source=self.recorder.store.source(doc.sprite)
-      self.preferences.sessionsBySource=self.preferences.sessionsBySource or {}
-      self.preferences.sessionsBySource[doc.project.source:gsub("\\","/")]=fs.normalizePath(fs.joinPath(session.folder,"session.json"))
-      self.recorder:guard(doc,function() self.recorder:resume(doc) end)
+      local previousSession,previousProject=doc.session,doc.project
+      doc.session,doc.project=session,session.project
+      local ok=self.recorder:guard(doc,function() self.recorder:resume(doc) end)
+      if not ok then doc.session,doc.project=previousSession,previousProject end
       self.selected=nil; self:refresh()
     end)
   end}
@@ -185,12 +239,16 @@ function Ui:show()
     self:attempt(function() self:exportDialog(assert(self:session())) end)
   end }
   dlg:newrow()
-  dlg:separator{text="Edit animation"}
-  dlg:button{text="Apply Edit to Session",onclick=function() self:attempt(function() self:applyEdit() end) end}
-  dlg:button{text="Export Edited Animation",onclick=function() self:attempt(function() self:exportAnimation() end) end}
+  dlg:separator{text="Advanced"}
+  dlg:check{id="advanced",text="Show editing and legacy tools",selected=false,onclick=function()
+    for _,id in ipairs({"applyEdit","exportAnimation","legacy"}) do dlg:modify{id=id,visible=dlg.data.advanced} end
+  end}
+  dlg:newrow()
+  dlg:button{id="applyEdit",visible=false,text="Apply Edit to Session",onclick=function() self:attempt(function() self:applyEdit() end) end}
+  dlg:button{id="exportAnimation",visible=false,text="Export Edited Animation",onclick=function() self:attempt(function() self:exportAnimation() end) end}
   dlg:newrow()
   dlg:separator{text="Files and settings"}
-  dlg:button{text="Open Legacy Folder",onclick=function() self:attempt(function() self.export.openFolder(self.recorder.store,self.recorder.store.root) end) end}
+  dlg:button{id="legacy",visible=false,text="Open Legacy Folder",onclick=function() self:attempt(function() self.export.openFolder(self.recorder.store,self.recorder.store.root) end) end}
   dlg:button{ text="Settings", onclick=function() self:settings() end }
   dlg:button{ text="Open Folder", onclick=function()
     self:attempt(function()
@@ -210,6 +268,8 @@ function Ui:settings()
   local crop = prefs.crop or {}
   local sprite = app.sprite
   local dlg = Dialog{ title="AseLaps Settings" }
+  dlg:entry{id="recordingFolder",label="Recording folder",text=self.recorder.store:recordingFolder()}
+  dlg:label{text="Choose a local folder outside OneDrive. Existing sessions stay in place."}
   dlg:check{ id="initial", label="New sessions", text="Initial snapshot", selected=prefs.initial ~= false }
   dlg:check{ id="auto", label="On reopen", text="Auto-resume recording", selected=prefs.autoResume ~= false }
   local intervals = {[500]="0.5 seconds", [1000]="1 second", [2000]="2 seconds"}
@@ -217,6 +277,13 @@ function Ui:settings()
     option=intervals[prefs.intervalMs or 500] }
   dlg:file{ id="ffmpeg", label="FFmpeg", title="Select ffmpeg.exe", open=true, entry=true,
     filename=self.export.encoderPath(prefs.ffmpeg), filetypes={"exe"} }
+  dlg:button{text="Check FFmpeg",onclick=function() self:attempt(function()
+    self.export.checkEncoder(self.recorder.store,dlg.data.ffmpeg)
+    app.alert("FFmpeg is ready.")
+  end) end}
+  dlg:label{text="MP4/GIF: get a Windows build from ffmpeg.org/download.html."}
+  dlg:newrow()
+  dlg:label{text="Extract it, then select bin/ffmpeg.exe. PNG export needs no FFmpeg."}
   dlg:separator{ text="Capture area for new sessions" }
   dlg:combobox{ id="area", label="Area", options={"Full canvas", "Fixed crop"},
     option=prefs.crop and "Fixed crop" or "Full canvas" }
@@ -228,6 +295,8 @@ function Ui:settings()
   dlg:button{ text="Save", onclick=function()
     self:attempt(function()
       local data = dlg.data
+      assert(self.export.isAbsolute(data.recordingFolder),"Choose an absolute recording folder.")
+      self.recorder.store.assertLocalPath(data.recordingFolder)
       local area
       if data.area == "Fixed crop" then
         area = {
@@ -245,11 +314,12 @@ function Ui:settings()
         encoder = fs.normalizePath(encoder)
       end
       prefs.initial, prefs.autoResume, prefs.ffmpeg, prefs.crop = data.initial, data.auto, encoder, area
+      prefs.recordingFolder=fs.normalizePath(data.recordingFolder)
       dlg:close()
     end)
   end }
   dlg:button{ text="Cancel" }
-  dlg:show()
+  dlg:show{autoscrollbars=true}
 end
 
 function Ui:pickFile(title, filename, save, types)
@@ -283,6 +353,7 @@ function Ui:sessions()
 end
 
 function Ui:assertPaused(session)
+  assert(not session.exporting,"Wait for the current export to finish.")
   for _, doc in pairs(self.recorder.documents) do
     assert(not (doc.running and doc.session.folder == session.folder), "Pause this recording before editing.")
   end
@@ -637,6 +708,14 @@ end
 
 function Ui:exportDialog(session, head, animation)
   local store,prefs=self.recorder.store,self.preferences
+  for _,doc in pairs(self.recorder.documents) do
+    if doc.running and store.pathKey(doc.session.folder)==store.pathKey(session.folder) then
+      self.recorder:status(doc,"paused")
+      session=doc.session
+      self.notice="Recording paused for preview and export. Use Resume to continue."
+    end
+  end
+  self:refresh()
   local saved=prefs.exportOptions or {}
   local timer, closed
   local dlg = Dialog{title="Preview and Export",onclose=function()
@@ -648,6 +727,7 @@ function Ui:exportDialog(session, head, animation)
   local ready, changing, playing = false, false, false
   local nearby, background, valid = {}, nil, false
   local playbackFrames, preparing
+  local previewRevision=session.editRevision
   local function stop()
     if timer then timer:stop() end
     playing = false
@@ -687,9 +767,15 @@ function Ui:exportDialog(session, head, animation)
     if not ready or preparing then return end
     stop()
     valid = false
+    if previewRevision~=session.editRevision then
+      previewRevision=session.editRevision
+      playbackFrames,nearby,timelines=nil,{},{}
+    end
     local data = dlg.data
     local ok, result = pcall(function()
       local step, fps = math.tointeger(data.step), math.tointeger(data.fps)
+      local hold=tonumber(data.hold)
+      assert(hold and hold>=0 and hold<=60,"Final hold must be between 0 and 60 seconds.")
       assert(step and step>=1 and step<=1000,"Use every 1 to 1000 recorded frames.")
       assert(fps and fps>=1 and fps<=60,"Choose 1 to 60 FPS.")
       assert(data.format ~= "MP4" or data.background ~= "Transparent","Choose a white or black background for MP4.")
@@ -711,7 +797,8 @@ function Ui:exportDialog(session, head, animation)
         sequences[mode] = self.export.sample(timeline.frames,step)
         for _,id in ipairs(timeline.missing) do missing[tostring(id)]=true end
         local count = #sequences[mode]
-        summaries[#summaries+1] = string.format("%s%d frames / %.2f sec",data.mode=="Both" and mode.." " or "",count,count/fps)
+        local outputCount=count+math.floor(hold*fps+0.5)
+        summaries[#summaries+1] = string.format("%s%d frames / %.2f sec",data.mode=="Both" and mode.." " or "",outputCount,outputCount/fps)
       end
       local mode = data.mode == "Both" and data.previewMode or data.mode
       local nextSequence=sequences[mode]
@@ -765,13 +852,14 @@ function Ui:exportDialog(session, head, animation)
     if not playbackFrames then
       preparing=true
       dlg:modify{id="play",text="Preparing preview...",enabled=false}
-      local ok, frames=pcall(function()
+      local ok, frames=pcall(function() return self:runTask("Preparing preview",function(control)
         local cache={}
         local w,h=session.info.captureWidth,session.info.captureHeight
         local scale=math.min(1,192/math.max(w,h),math.sqrt(48*1024*1024/(4*w*h*#sequence)))
         local size=Size(math.max(1,math.floor(w*scale)),math.max(1,math.floor(h*scale)))
-        for _,id in ipairs(sequence) do
-          if closed then return end
+        for i,id in ipairs(sequence) do
+          coroutine.yield({phase="Preparing preview",done=i-1,total=#sequence})
+          if closed or control.cancelled then return end
           if not cache[id] then
             local thumbnail=store.loadSnapshot(session,id)
             if thumbnail.width~=size.width or thumbnail.height~=size.height then
@@ -781,11 +869,12 @@ function Ui:exportDialog(session, head, animation)
           end
         end
         return cache
-      end)
+      end) end)
       preparing=false
       if closed then return end
       dlg:modify{id="play",text="Play",enabled=true}
       if not ok then app.alert{title="AseLaps",text=tostring(frames)}; return end
+      if not frames then return end
       playbackFrames=frames
     end
     if frame==#sequence and not move(1) then return end
@@ -825,6 +914,7 @@ function Ui:exportDialog(session, head, animation)
   dlg:combobox{id="mode",label="History",options=session.info.version>=2 and {"Full"} or {"Full","Clean","Both"},option=head and "Clean" or "Full",visible=session.info.version==1,onchange=update}
   dlg:combobox{id="previewMode",label="Preview history",options={"Full","Clean"},visible=false,onchange=update}
   dlg:number{id="fps",label="Playback FPS",text=tostring(saved.fps or 30),onchange=update}
+  dlg:number{id="hold",label="Hold final frame (seconds)",text=tostring(saved.hold or 0),decimals=2,onchange=update}
   dlg:number{id="step",label="Use every Nth recorded frame",text=tostring(animation and 1 or saved.step or 5),onchange=update}
   dlg:number{id="first",label="Recorded range from / to",text="1"}
   dlg:number{id="last",text="1"}
@@ -854,7 +944,7 @@ function Ui:exportDialog(session, head, animation)
   end
   dlg:button{text="Exclude range",onclick=function() range(true) end}
   dlg:button{text="Restore range",onclick=function() range(false) end}
-  if session.boundaries and #session.boundaries>0 then
+  if not session.info.crop and session.boundaries and #session.boundaries>0 then
     local function resizeLabel()
       local count = 0
       for _,b in ipairs(session.boundaries) do if b.uncertain then count=count+1 end end
@@ -882,7 +972,6 @@ function Ui:exportDialog(session, head, animation)
     stop()
     self:attempt(function()
       local options=dlg.data
-      options.hold=0
       options.sequences=sequences
       if options.format~="PNG sequence" then
         local encoder=options.encoder
@@ -925,9 +1014,18 @@ function Ui:exportDialog(session, head, animation)
         options.sequencePrefix=fs.fileTitle(path)
         options.output=nil
       end
-      local outputs=self.export.run(store,session,options)
+      session.exporting=true
+      local ok,outputs=pcall(function()
+        return self:runTask("Exporting timelapse",function(control)
+          options.control=control
+          return self.export.run(store,session,options)
+        end)
+      end)
+      session.exporting=nil
+      if not ok then error(outputs,0) end
+      if not outputs then return end
       prefs.lastExportFolder=fs.filePath(path)
-      prefs.exportOptions={format=options.format,fps=options.fps,step=options.step,scale=options.scale,background=options.background,ratio=options.ratio}
+      prefs.exportOptions={format=options.format,fps=options.fps,hold=options.hold,step=options.step,scale=options.scale,background=options.background,ratio=options.ratio}
       dlg:close()
       if app.alert{title="Export complete",text=outputs,buttons={"Done","Open folder"}}==2 then
         self.export.openFolder(store,fs.isDirectory(outputs[1]) and outputs[1] or fs.filePath(outputs[1]))

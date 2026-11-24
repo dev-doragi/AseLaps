@@ -2,7 +2,7 @@
   "name": "AseLaps",
   "displayName": "AseLaps",
   "description": "Canvas timelapse recording with independent edit history.",
-  "version": "2.1.2",
+  "version": "2.2.0-rc.1",
   "publisher": "AseLaps",
   "categories": ["Scripts"],
   "contributes": {

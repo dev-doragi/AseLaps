@@ -1,5 +1,5 @@
 param(
-    [Parameter(Mandatory)][ValidateSet('export', 'browse', 'open', 'check')][string]$Action,
+    [Parameter(Mandatory)][ValidateSet('export', 'start', 'worker', 'browse', 'open', 'check')][string]$Action,
     [Parameter(Mandatory)][ValidatePattern('^AseLaps-[0-9]+_[0-9]+$')][string]$JobName
 )
 
@@ -8,6 +8,22 @@ $job = Join-Path ([IO.Path]::GetTempPath()) $JobName
 $request = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $job 'request.json') | ConvertFrom-Json
 
 switch ($Action) {
+    'start' {
+        $scriptPath = Join-Path $PSScriptRoot 'windows.ps1'
+        $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $scriptPath + '" worker ' + $JobName
+        Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+    }
+    'worker' {
+        try {
+            Add-Type -Path (Join-Path $PSScriptRoot 'RawEncoder.cs')
+            [AseLapsRawEncoder]::RunJob([string]$request.executable, [string[]]$request.arguments, [string]$request.log, [string]$request.cancel, [string]$request.status)
+        }
+        catch {
+            [IO.File]::WriteAllText([string]$request.log, ($_ | Out-String))
+            [IO.File]::WriteAllText([string]$request.status, 'failed')
+            exit 1
+        }
+    }
     'check' {
         & ([string]$request.executable) -version | Out-Null
         exit $LASTEXITCODE

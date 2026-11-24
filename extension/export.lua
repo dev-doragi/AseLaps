@@ -4,9 +4,6 @@ local Export = { defaultStep=10 }
 local launcher = join(fs.filePath(debug.getinfo(1, "S").source:sub(2)), "AseLaps.cmd")
 
 function Export.encoderPath(remembered)
-  local default = join(assert(os.getenv("USERPROFILE")), "Projects", "AseLaps", "tools", "ffmpeg", "ffmpeg.exe")
-  if remembered and fs.isFile(remembered) then return remembered end
-  if fs.isFile(default) then return default end
   return remembered or ""
 end
 
@@ -45,6 +42,7 @@ end
 
 function Export.isAbsolute(path)
   return type(path) == "string" and (path:match("^%a:[/\\]") or path:sub(1, 2) == "\\\\")
+    and not path:sub(3):find('[:*?"<>|]')
 end
 
 local function launcherCommand()
@@ -60,6 +58,46 @@ local function launcherCommand()
     end
   end
   return launcher
+end
+
+local function checkpoint(options,phase,done,total)
+  if not options.control then return end
+  assert(not options.control.cancelled,"Export cancelled.")
+  coroutine.yield({phase=phase,done=done,total=total})
+  assert(not options.control.cancelled,"Export cancelled.")
+end
+
+local function backgroundEncode(store,args,folder,options,log)
+  local job=store.numberedDirectory(fs.tempPath,"AseLaps-"..os.time())
+  local request=join(job,"request.json")
+  local status=join(job,"status.txt")
+  local cancel=join(job,"cancel")
+  local progress=join(job,"progress.txt")
+  table.insert(args,1,progress)
+  table.insert(args,1,"-progress")
+  store.writeText(request,json.encode({executable=options.ffmpeg,arguments=args,log=log,status=status,cancel=cancel}))
+  local command='""'..launcherCommand()..'" start '..fs.fileName(job)..'"'
+  assert(os.execute(command),"Could not start encoder. Job: "..job)
+  local requested,result,readStarted=false,nil,nil
+  while not result do
+    if fs.isFile(status) then
+      local ok,value=pcall(store.readText,status)
+      if ok and value~="" then result=value; break end
+      readStarted=readStarted or os.time()
+      assert(os.time()-readStarted<5,"Cannot read encoder completion status. Job: "..job)
+    end
+    if options.control.cancelled and not requested then store.writeText(cancel,"cancel"); requested=true end
+    local count=0
+    if fs.isFile(progress) then
+      local ok,bytes=pcall(store.readText,progress)
+      if ok then for value in bytes:gmatch("frame=(%d+)") do count=tonumber(value) end end
+    end
+    coroutine.yield({phase=requested and "Cancelling encoder" or "Encoding",done=count,total=options.frameCount})
+  end
+  for _,name in ipairs({"request.json","cancel","progress.txt","status.txt"}) do store.remove(join(job,name)) end
+  fs.removeDirectory(job)
+  assert(result=="done" and not options.control.cancelled,
+    (result=="cancelled" or options.control.cancelled) and "Export cancelled." or "Encoder failed. Log: "..log)
 end
 
 local function runHelper(store, action, data, produce)
@@ -123,6 +161,7 @@ local function pngSequence(store, session, frames, folder, geometry, options)
   local color = fill(options.background)
   local last
   for i, id in ipairs(frames) do
+    checkpoint(options,"Saving PNG frames",i-1,#frames+options.holdFrames)
     local source = store.snapshotPath(session, id)
     local path = join(folder, string.format("%s_%06d.png", options.sequencePrefix or "frame", i))
     local image = store.loadSnapshot(session, id)
@@ -142,6 +181,7 @@ local function pngSequence(store, session, frames, folder, geometry, options)
     last = path
   end
   for i = 1, options.holdFrames do
+    checkpoint(options,"Saving final hold",#frames+i-1,#frames+options.holdFrames)
     store.copy(last, join(folder, string.format("%s_%06d.png", options.sequencePrefix or "frame", #frames + i)))
   end
   return folder
@@ -153,6 +193,7 @@ local function encode(store, session, frames, folder, geometry, options)
   local pending = join(folder, "timelapse.pending." .. ext)
   local output = join(folder, "timelapse." .. ext)
   local log = join(folder, "ffmpeg.log")
+  local raw=join(folder,"frames.rgba")
   local ok, err = pcall(function()
     local args = {"-hide_banner", "-nostdin", "-n", "-loglevel", "warning", "-xerror"}
     local function add(...)
@@ -160,7 +201,7 @@ local function encode(store, session, frames, folder, geometry, options)
     end
     add("-f", "rawvideo", "-pixel_format", "rgba", "-video_size",
       string.format("%dx%d", session.info.captureWidth, session.info.captureHeight),
-      "-framerate", tostring(options.fps), "-i", "pipe:0")
+      "-framerate", tostring(options.fps), "-i", options.control and raw or "pipe:0")
 
     -- Use one timestamp per selected frame, including repeated Undo/Redo images.
     local filters = string.format(
@@ -192,6 +233,21 @@ local function encode(store, session, frames, folder, geometry, options)
       if transparent then add("-gifflags", "-offsetting-transdiff") end
     end
     add(pending)
+    if options.control then
+      do
+        store.assertLocalPath(raw)
+        local stream <close> = assert(io.open(raw,"wb"))
+        for i,id in ipairs(frames) do
+          checkpoint(options,"Preparing video frames",i-1,#frames)
+          local image=store.loadSnapshot(session,id)
+          assert(image.width==session.info.captureWidth and image.height==session.info.captureHeight,"Frame size changed during export.")
+          assert(stream:write(image.bytes))
+        end
+        assert(stream:flush())
+      end
+      options.frameCount=#frames+options.holdFrames
+      backgroundEncode(store,args,folder,options,log)
+    else
     local success, code = runHelper(store, "export", {
       executable=options.ffmpeg, arguments=args, log=log, stream=true
     },function(pipe)
@@ -203,6 +259,7 @@ local function encode(store, session, frames, folder, geometry, options)
       end
     end)
     assert(success, string.format("FFmpeg failed (%s). Log: %s", tostring(code), log))
+    end
     assert(fs.isFile(pending) and fs.fileSize(pending) > 0, "No video produced. Log: " .. log)
     store.move(pending, output)
   end)
@@ -212,6 +269,7 @@ local function encode(store, session, frames, folder, geometry, options)
       print("AseLaps: temporary export data could not be removed: " .. path)
     end
   end
+  remove(raw)
   if not ok then
     remove(pending)
     error(err, 0)
@@ -230,7 +288,7 @@ function Export.run(store, session, input)
   assert(session.info.version == 1 or input.mode == "Full", "Sampled sessions support Full history only.")
   local options = {
     format=input.format, background=input.background, ratio=input.ratio, sequencePrefix=input.sequencePrefix,
-    scale=input.scale, ffmpeg=input.ffmpeg, fps=integer(input.fps, 1, 60, "FPS")
+    scale=input.scale, ffmpeg=input.ffmpeg, control=input.control, fps=integer(input.fps, 1, 60, "FPS")
   }
   local step = integer(input.step or Export.defaultStep, 1, 1000, "Frame interval")
   assert(options.format == "MP4" or options.format == "GIF" or options.format == "PNG sequence",
@@ -261,35 +319,63 @@ function Export.run(store, session, input)
   local destination = input.folder or (input.output and fs.filePath(input.output))
   if destination == "" then destination = join(session.project.folder, "exports") end
   assert(Export.isAbsolute(destination), "Enter an absolute Windows output folder.")
-  local outputs = {}
-  for _, mode in ipairs(modes) do
-    local folder
-    if input.sequenceFolder then
-      folder=input.sequenceFolder
-      if #modes>1 then folder=folder .. "_" .. mode end
-      assert(not fs.isDirectory(folder),"PNG sequence folder already exists.")
-      store.ensureDirectory(folder)
-    else folder = store.numberedDirectory(destination, "AseLaps_" .. mode .. "_" .. session.name) end
-    if options.format == "PNG sequence" then
-      outputs[#outputs + 1] = pngSequence(store, session, sequences[mode], folder, geometry, options)
-    else
-      local encoded = encode(store, session, sequences[mode], folder, geometry, options)
-      if input.output then
-        local target = input.output
-        if #modes > 1 then target = target:gsub("(%.[^.]+)$", "_" .. mode .. "%1") end
-        if fs.isFile(target) then
-          assert(input.overwrite, "Output already exists.")
-          -- Keep the previous video until encoding has completed successfully.
-          local backup = target .. ".backup-" .. os.time()
-          assert(not fs.isFile(backup), "Output backup already exists.")
-          store.move(target, backup)
-          local moved, message = pcall(store.move, encoded, target)
-          if not moved then store.move(backup, target); error(message) end
-          assert(store.remove(backup))
-        else store.move(encoded,target) end
-        outputs[#outputs+1] = target
-      else outputs[#outputs+1] = encoded end
+  local outputs,tasks = {},{}
+  local function cleanup(task,keepLog)
+    if not fs.isDirectory(task.folder) then return end
+    for _,entry in ipairs(fs.listFiles(task.folder)) do
+      local path=join(task.folder,fs.fileName(entry))
+      if not keepLog or fs.fileName(path)~="ffmpeg.log" then assert(store.remove(path)) end
     end
+    if not keepLog then assert(fs.removeDirectory(task.folder)) end
+  end
+  local ok,message=pcall(function()
+    for _,mode in ipairs(modes) do
+      local target=input.sequenceFolder or input.output
+      if target and #modes>1 then
+        if input.sequenceFolder then target=target.."_"..mode
+        else target=target:gsub("(%.[^.]+)$","_"..mode.."%1") end
+      end
+      if target then
+        store.assertLocalPath(target)
+        assert(not fs.isDirectory(target),"Output folder already exists. Choose another name.")
+        assert(not fs.isFile(target) or (input.overwrite and not input.sequenceFolder),"Output already exists.")
+      end
+      local parent=input.sequenceFolder and fs.filePath(input.sequenceFolder) or destination
+      local folder=store.numberedDirectory(parent,"AseLaps_"..mode.."_"..session.name)
+      local task={folder=folder,target=target}
+      tasks[#tasks+1]=task
+      if options.format=="PNG sequence" then
+        task.staged=pngSequence(store,session,sequences[mode],folder,geometry,options)
+      else task.staged=encode(store,session,sequences[mode],folder,geometry,options) end
+      outputs[#outputs+1]=target or task.staged
+    end
+    checkpoint(options,"Finishing export",1,1)
+    -- Prepare every mode first. Never yield while replacing final output files.
+    for _,task in ipairs(tasks) do
+      if task.target then
+        if fs.isFile(task.target) then
+          task.backup=join(task.folder,"previous-output.backup")
+          store.move(task.target,task.backup)
+        end
+        store.move(task.staged,task.target)
+        task.committed=true
+      end
+    end
+  end)
+  if not ok then
+    for i=#tasks,1,-1 do
+      local task=tasks[i]
+      if task.committed then
+        if input.sequenceFolder then store.move(task.target,task.folder)
+        else store.remove(task.target) end
+      end
+      if task.backup and fs.isFile(task.backup) then store.move(task.backup,task.target) end
+      cleanup(task,not (options.control and options.control.cancelled))
+    end
+    error(message,0)
+  end
+  for _,task in ipairs(tasks) do
+    if task.target and not input.sequenceFolder then cleanup(task,false) end
   end
   return outputs
 end

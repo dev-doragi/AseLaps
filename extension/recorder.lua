@@ -53,11 +53,12 @@ function Recorder:start(doc, crop, initial, folder)
   self.preferences.sessionsBySource[self.store.source(sprite):gsub("\\","/")] = app.fs.normalizePath(app.fs.joinPath(doc.session.folder,"session.json"))
   doc.elapsedBase, doc.started, doc.running = 0, os.time(), true
   doc.view, doc.dirty, doc.nextCapture = nil, false, self.clock+interval
-  self:append(doc, {kind="status", status="recording"})
+  self:append(doc, {kind="status", status="recording", source=self.store.source(doc.sprite)})
   if initial ~= false then self:sample(doc, true) end
 end
 function Recorder:resume(doc)
   assert(doc.session and not doc.running, "Select a paused session first.")
+  self:canResume(doc,doc.session)
   if doc.session.info.version < 3 then
     local crop = doc.session.info.crop
     if crop and (crop.x+crop.w > doc.sprite.width or crop.y+crop.h > doc.sprite.height) then crop = nil end
@@ -67,10 +68,23 @@ function Recorder:resume(doc)
   assert(doc.session.history.status ~= "stopped", "Start a new session after stopping.")
   doc.elapsedBase, doc.started, doc.running = doc.session.history.elapsed, os.time(), true
   doc.view, doc.dirty, doc.nextCapture = nil, true, self.clock+doc.session.info.intervalMs
-  self:append(doc, {kind="status", status="recording"})
+  self:append(doc, {kind="status", status="recording", source=self.store.source(doc.sprite)})
+  doc.project.source=self.store.source(doc.sprite)
+  self.preferences.sessionsBySource=self.preferences.sessionsBySource or {}
+  self.preferences.sessionsBySource[self.store.pathKey(doc.project.source)]=app.fs.joinPath(doc.session.folder,"session.json")
+end
+function Recorder:canResume(doc,session)
+  assert(doc.sprite.hasAssociatedFile,"Save the artwork before resuming.")
+  assert(not session.exporting,"Wait for the current export to finish.")
+  assert(session.history.status~="stopped","Start a new session after stopping.")
+  for _,other in pairs(self.documents) do
+    assert(not (other~=doc and other.running and other.session and
+      self.store.pathKey(other.session.folder)==self.store.pathKey(session.folder)),
+      "This session is already recording in another document.")
+  end
 end
 function Recorder:sample(doc, manual)
-  if not doc.running or not doc.sprite.isValid or app.sprite ~= doc.sprite then return end
+  if not doc.running or not doc.sprite.isValid then return end
   local info = doc.session.info
   if info.version~=4 and (doc.sprite.width ~= info.width or doc.sprite.height ~= info.height) then
     local crop = info.crop
@@ -79,7 +93,9 @@ function Recorder:sample(doc, manual)
     doc.running = false
     return self:start(doc, crop, info.initial)
   end
-  local frame = app.frame and app.frame.frameNumber or 1
+  local frame = doc.frame or 1
+  if (manual or not doc.dirty) and app.sprite==doc.sprite and app.frame then frame=app.frame.frameNumber end
+  frame=math.min(frame,#doc.sprite.frames)
   local image = render(doc.sprite, frame, info.version==4 and {} or info)
   local previous = doc.view
   if not previous or previous.frame ~= frame or not previous.image:isEqual(image) then
@@ -108,6 +124,7 @@ function Recorder:capture(doc, fromUndo, manual)
   if not doc.running then return end
   if manual then return self:sample(doc, true) end
   doc.dirty = true
+  if app.sprite==doc.sprite and app.frame then doc.frame=app.frame.frameNumber end
   local session=doc.session
   if session.info.version==4 and app.sprite==doc.sprite then
     local last=session.records[session.lastCapture]
@@ -154,19 +171,36 @@ function Recorder:document(sprite)
   local source=self.store.source(sprite)
   local remembered=source and self.preferences.sessionsBySource and (self.preferences.sessionsBySource[source:gsub("\\","/")] or self.preferences.sessionsBySource[source])
   if remembered and app.fs.isFile(remembered) then
-    doc.session=self.store:open(remembered)
-    doc.project=doc.session.project
-    doc.project.source=source
+    local candidate=self.store:open(remembered)
+    if self.store.pathKey(candidate.project.source)==self.store.pathKey(source) then
+      doc.session=candidate
+      doc.project=candidate.project
+    end
   end
   doc.project = doc.project or self.store:project(sprite, false)
   if doc.project and not doc.session then
     local sessions = self.store:sessions(doc.project)
-    if #sessions > 0 then doc.session = self.store:load(sessions[#sessions]) end
+    for i=#sessions,1,-1 do
+      local candidate=sessions[i]
+      local knownSource=candidate.info.source
+      if not candidate.project.standalone then knownSource=knownSource or candidate.project.source end
+      if self.store.pathKey(knownSource)==self.store.pathKey(source) then
+        local loaded=self.store:load(candidate)
+        if self.store.pathKey(loaded.project.source)==self.store.pathKey(source) then
+          doc.session,doc.project=loaded,loaded.project
+          break
+        end
+      end
+    end
   end
   return doc
 end
 function Recorder:site()
-  -- Frame navigation deliberately performs no rendering or storage work.
+  for _,doc in pairs(self.documents) do
+    if doc.running and doc.dirty and doc.sprite.isValid then
+      self:guard(doc,function() self:flush(doc) end)
+    end
+  end
 end
 function Recorder:tick(milliseconds)
   self.clock = self.clock+(milliseconds or 250)
@@ -195,9 +229,15 @@ function Recorder:tick(milliseconds)
   end)
 end
 function Recorder:watch()
+  self.listeners[#self.listeners+1]=app.events:on("sitechange",function() self:site() end)
+  self.listeners[#self.listeners+1]=app.events:on("beforecommand",function(ev)
+    if ev.name=="CloseFile" or ev.name=="CloseAllFiles" or ev.name=="Exit" then self:site() end
+  end)
   self:tick(0)
 end
 function Recorder:shutdown()
+  for _,id in ipairs(self.listeners) do app.events:off(id) end
+  self.listeners={}
   for _, doc in pairs(self.documents) do
     self:guard(doc, function()
       if doc.running then self:status(doc, "recording") end

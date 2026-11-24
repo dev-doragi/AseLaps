@@ -78,7 +78,11 @@ local function numberedDirectory(root, prefix)
 end
 
 function Store.recordingRoot()
-  return join(assert(os.getenv("USERPROFILE")), "Downloads", "IncreParty_Illust")
+  return join(assert(os.getenv("USERPROFILE")), "Downloads", "AseLaps")
+end
+
+function Store.pathKey(path)
+  return path and fs.normalizePath(path):gsub("\\", "/"):lower():gsub("/+$", "")
 end
 
 function Store.assertLocalPath(path)
@@ -95,8 +99,12 @@ function Store.assertLocalPath(path)
   end
 end
 
-function Store.new(root, history)
-  return setmetatable({ root=root, history=history }, Store)
+function Store.new(root, history, preferences)
+  return setmetatable({ root=root, history=history, preferences=preferences or {} }, Store)
+end
+
+function Store:recordingFolder()
+  return self.preferences.recordingFolder or Store.recordingRoot()
 end
 
 function Store.source(sprite)
@@ -122,7 +130,7 @@ end
 function Store:project(sprite, create)
   local source = Store.source(sprite)
   if not source then return nil end
-  local folder = join(Store.recordingRoot(), fs.fileTitle(sprite.filename) .. "__record")
+  local folder = join(self:recordingFolder(), fs.fileTitle(sprite.filename) .. "__record")
   local project = {folder=folder, title=fs.fileTitle(sprite.filename), source=source, standalone=true}
   if fs.isDirectory(folder) or create then return project end
   for _, legacy in ipairs(self:projects()) do
@@ -196,6 +204,8 @@ function Store.loadNative(session,id)
 end
 
 function Store.offset(session,id)
+  local crop=session.info.crop
+  if crop then return -crop.x,-crop.y end
   local dx,dy=0,0
   for _,b in ipairs(session.boundaries) do
     if id<b.id then dx,dy=dx+b.dx,dy+b.dy end
@@ -214,7 +224,7 @@ local function indexRecord(session,event)
     local b=event.boundary
     b.id=id
     session.boundaries[#session.boundaries+1]=b
-    session.info.captureWidth,session.info.captureHeight=r.w,r.h
+    if not session.info.crop then session.info.captureWidth,session.info.captureHeight=r.w,r.h end
   end
 end
 
@@ -233,7 +243,7 @@ function Store.loadSnapshot(session, id)
   if type(id)=="string" then
     local edited=Store.loadImage(Store.snapshotPath(session,id))
     local anchor=session.editAnchors and session.editAnchors[id]
-    if not anchor then return edited end
+    if not anchor or session.info.crop then return edited end
     local x,y=0,0
     for _,b in ipairs(session.boundaries) do
       if b.id>anchor.id then x,y=x+b.dx,y+b.dy end
@@ -341,10 +351,13 @@ local function completePng(session, id)
 end
 
 function Store:load(descriptor)
+  local project={}
+  for key,value in pairs(descriptor.project) do project[key]=value end
   local session = {
-    folder=descriptor.folder, project=descriptor.project, name=descriptor.name,
+    folder=descriptor.folder, project=project, name=descriptor.name,
     info=readJson(join(descriptor.folder,"session.json")), records={}, boundaries={}, pack=join(descriptor.folder,"frames.pack"), nextPng=1, recovered=false, missing={}, editOps={}, editRevision=0
   }
+  if session.info.source then project.source=session.info.source end
   assert(session.info.version == 1 or session.info.version == 2 or session.info.version == 3 or session.info.version == 4, "Unsupported AseLaps session format.")
   if session.info.version == 2 then
     assert(session.info.captureMode == "sampled" and session.info.rowStride == session.info.captureWidth*4
@@ -406,6 +419,7 @@ function Store:load(descriptor)
             session.recovered = true
           else
             session.history:apply(event)
+            if event.source then session.project.source=event.source end
             if png and session.info.version==4 then
               indexRecord(session,event)
               session.nextPng=png+1
@@ -494,9 +508,18 @@ function Store.loadEdits(session)
     b.dx,b.dy,b.uncertain=table.unpack(b.original)
   end
   if not fs.isFile(path) then return end
-  for line in read(path):gmatch("[^\n]+\n") do
+  local bytes=read(path)
+  session.editTail=nil
+  if bytes~="" and bytes:sub(-1)~="\n" then
+    local ending=bytes:match(".*()\n") or 0
+    session.editTail=bytes:sub(ending+1)
+    bytes=bytes:sub(1,ending)
+    session.recovered=true
+  end
+  for line in bytes:gmatch("[^\n]+\n") do
     local ok, event = pcall(decode, line)
     if not ok then error("Damaged edit history: " .. path) end
+    assert(type(event)=="table" and (event.kind=="undo" or event.kind=="exclude" or event.kind=="replace" or event.kind=="alignment"),"Invalid edit history: "..path)
     session.editRevision = session.editRevision + 1
     if event.kind == "undo" then table.remove(session.editOps)
     else session.editOps[#session.editOps+1] = event end
@@ -518,13 +541,25 @@ applyAlignments=function(session)
 end
 
 function Store.edit(session, operation)
+  assert(not session.exporting,"Wait for the current export to finish.")
   if session.info.version==4 and operation.kind=="replace" then
     operation.anchor={id=session.lastCapture,crop=#session.boundaries==0 and session.info.crop or nil}
   end
   local path = join(session.folder, "edits.jsonl")
   if fs.isFile(path) then
     local bytes = read(path)
-    assert(bytes == "" or bytes:sub(-1) == "\n", "Incomplete edit journal. Restore the last complete line before editing.")
+    if bytes~="" and bytes:sub(-1)~="\n" then
+      -- Preserve the interrupted journal before restoring its committed prefix.
+      local ending=bytes:match(".*()\n") or 0
+      local backup=numberedDirectory(session.folder,"edit-recovery")
+      Store.copy(path,join(backup,"edits.jsonl"))
+      local pending=path..".recovered"
+      write(pending,bytes:sub(1,ending),"wb")
+      local original=join(backup,"original.jsonl")
+      Store.move(path,original)
+      local ok,message=pcall(Store.move,pending,path)
+      if not ok then Store.move(original,path); error(message,0) end
+    end
   end
   write(path, json.encode(operation) .. "\n", "ab")
   Store.loadEdits(session)
@@ -590,10 +625,16 @@ function Store:convert(session, parent)
       for _, id in ipairs(operation.frames) do
         local target = Store.snapshotPath(converted,id)
         ensureDirectory(fs.filePath(target))
-        Store.copy(Store.snapshotPath(session,id),target)
+        Store.writeImage(Store.loadSnapshot(session,id),target)
+        assert(Store.loadImage(target):isEqual(Store.loadSnapshot(session,id)),"Edited PNG verification failed.")
       end
     end
-    Store.edit(converted,operation)
+    if operation.kind~="alignment" then
+      local copy={}
+      for key,value in pairs(operation) do copy[key]=value end
+      copy.anchor=nil
+      Store.edit(converted,copy)
+    end
   end
   return self:load(converted)
 end
