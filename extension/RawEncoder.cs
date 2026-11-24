@@ -33,8 +33,7 @@ public static class AseLapsRawEncoder
         return quoted.ToString();
     }
 
-    public static int Run(string executable, string[] arguments, string[] sources,
-        long frameBytes, string log)
+    public static int Run(string executable, string[] arguments, string log)
     {
         StringBuilder command = new StringBuilder();
         foreach (string argument in arguments)
@@ -55,14 +54,9 @@ public static class AseLapsRawEncoder
             try
             {
                 Stream input = process.StandardInput.BaseStream;
-                foreach (string source in sources)
+                using (Stream frames = Console.OpenStandardInput())
                 {
-                    using (FileStream frame = File.OpenRead(source))
-                    {
-                        if (frame.Length != frameBytes)
-                            throw new InvalidDataException("Incomplete RGBA snapshot: " + source);
-                        frame.CopyTo(input);
-                    }
+                    frames.CopyTo(input);
                 }
             }
             catch (Exception error)

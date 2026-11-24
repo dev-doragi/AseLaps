@@ -3,14 +3,16 @@ local function module(name) return dofile(app.fs.joinPath(root, "extension", nam
 local H,S,R,E = module("history"),module("store"),module("recorder"),module("export")
 assert(loadfile(app.fs.joinPath(root,"extension","ui.lua")))
 assert(loadfile(app.fs.joinPath(root,"extension","init.lua")))
+S.recordingRoot=function() return app.fs.joinPath(work,"local-recordings") end
 local store = S.new(work,H)
 local warnings={}
 local r=R.new(store,H,{},function(s) warnings[#warnings+1]=s end)
 local sprite=Sprite(16,16)
+sprite:saveAs(app.fs.joinPath(work,"art.aseprite"))
 local doc=r:document(sprite)
 r:start(doc)
 local session=doc.session
-assert(session.info.version==2 and session.history.count==1)
+assert(session.info.version==4 and session.history.count==1)
 local function paint(x)
   app.useTool{tool="pencil",color=Color{r=255,g=17,b=31,a=128},points={Point(x,1)}}
 end
@@ -45,7 +47,6 @@ if app.params.ffmpeg then
     options.format=format
     options.background="White"
     local loadSnapshot,writeImage=S.loadSnapshot,S.writeImage
-    S.loadSnapshot=function() error("Video export must not decode RGBA in Aseprite") end
     S.writeImage=function() error("Video export must not create intermediate PNGs") end
     local outputs=E.run(store,session,options)
     S.loadSnapshot,S.writeImage=loadSnapshot,writeImage
@@ -56,8 +57,9 @@ if app.params.ffmpeg then
     E.run(store,legacy,options)
   end
 end
-local f=assert(io.open(S.snapshotPath(session,5),"wb")); f:write("bad"); f:close()
-assert(store:load(session).history.count==4)
+local f=assert(io.open(session.journal,"ab")); f:write("partial"); f:close()
+local recovered=store:load(session)
+assert(recovered.recovered and #S.timeline(recovered,"Full")==5)
 assert(#warnings==0,table.concat(warnings,"\n"))
 r:shutdown()
 print("ASELAPS_SAMPLED_OK")

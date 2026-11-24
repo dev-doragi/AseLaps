@@ -1,7 +1,14 @@
 local fs = app.fs
 local join = fs.joinPath
-local Export = { defaultStep=8 }
+local Export = { defaultStep=10 }
 local launcher = join(fs.filePath(debug.getinfo(1, "S").source:sub(2)), "AseLaps.cmd")
+
+function Export.encoderPath(remembered)
+  local default = join(assert(os.getenv("USERPROFILE")), "Projects", "AseLaps", "tools", "ffmpeg", "ffmpeg.exe")
+  if remembered and fs.isFile(remembered) then return remembered end
+  if fs.isFile(default) then return default end
+  return remembered or ""
+end
 
 local function integer(value, minimum, maximum, label)
   local number = math.tointeger(tonumber(value))
@@ -55,7 +62,7 @@ local function launcherCommand()
   return launcher
 end
 
-local function runHelper(store, action, data)
+local function runHelper(store, action, data, produce)
   assert(fs.isFile(launcher), "AseLaps Windows helper is missing. Reinstall the extension.")
   local folder = store.numberedDirectory(fs.tempPath, "AseLaps-" .. os.time())
   local request = join(folder, "request.json")
@@ -63,7 +70,17 @@ local function runHelper(store, action, data)
   local command = '""' .. launcherCommand() .. '" ' .. action .. " " .. fs.fileName(folder) .. '"'
   local called, ok, code, result = pcall(function()
     store.writeText(request, json.encode(data))
-    local success, _, exitCode = os.execute(command)
+    local success, exitCode
+    if produce then
+      local pipe=assert(io.popen(command,"wb"))
+      local wrote,message=pcall(produce,pipe)
+      local reason
+      success,reason,exitCode=pipe:close()
+      if not wrote then error(message,0) end
+    else
+      local reason
+      success,reason,exitCode=os.execute(command)
+    end
     local selected
     if success and action == "browse" and fs.isFile(selection) then
       selected = store.readText(selection)
@@ -76,6 +93,13 @@ local function runHelper(store, action, data)
   if not cleaned or not removed then print("AseLaps: temporary request remains at " .. folder) end
   if not called then error(ok, 0) end
   return ok, code, result
+end
+
+function Export.checkEncoder(store,path)
+  assert(Export.isAbsolute(path) and fs.fileName(path):lower()=="ffmpeg.exe" and fs.isFile(path),
+    "Locate ffmpeg.exe to export a video.")
+  assert(runHelper(store,"check",{executable=path}), "FFmpeg could not start. Locate a working ffmpeg.exe.")
+  return true
 end
 
 function Export.chooseFolder(store, initial, fallback)
@@ -99,12 +123,12 @@ local function pngSequence(store, session, frames, folder, geometry, options)
   local color = fill(options.background)
   local last
   for i, id in ipairs(frames) do
-    local source = store.png(session, id)
-    local path = join(folder, string.format("frame_%06d.png", i))
+    local source = store.snapshotPath(session, id)
+    local path = join(folder, string.format("%s_%06d.png", options.sequencePrefix or "frame", i))
     local image = store.loadSnapshot(session, id)
     if geometry.outWidth == session.info.captureWidth
       and geometry.outHeight == session.info.captureHeight and color == 0 then
-      if session.info.version == 2 then store.writeImage(image, path)
+      if session.info.version >= 4 or session.info.version == 2 then store.writeImage(image, path)
       else store.copy(source, path) end
     else
       if image.width ~= geometry.width or image.height ~= geometry.height then
@@ -118,43 +142,25 @@ local function pngSequence(store, session, frames, folder, geometry, options)
     last = path
   end
   for i = 1, options.holdFrames do
-    store.copy(last, join(folder, string.format("frame_%06d.png", #frames + i)))
+    store.copy(last, join(folder, string.format("%s_%06d.png", options.sequencePrefix or "frame", #frames + i)))
   end
   return folder
 end
 
 local function encode(store, session, frames, folder, geometry, options)
-  local manifest = join(folder, "frames.ffconcat")
   local transparent = options.background == "Transparent"
   local ext = options.format:lower()
   local pending = join(folder, "timelapse.pending." .. ext)
   local output = join(folder, "timelapse." .. ext)
   local log = join(folder, "ffmpeg.log")
   local ok, err = pcall(function()
-    local sources
     local args = {"-hide_banner", "-nostdin", "-n", "-loglevel", "warning", "-xerror"}
     local function add(...)
       for _, value in ipairs({...}) do args[#args + 1] = value end
     end
-    if session.info.version == 2 then
-      assert(session.info.rowStride == session.info.captureWidth * 4, "Unexpected RGBA row stride.")
-      sources = {}
-      for _, id in ipairs(frames) do
-        sources[#sources + 1] = store.snapshotPath(session, id)
-      end
-      add("-f", "rawvideo", "-pixel_format", "rgba", "-video_size",
-        string.format("%dx%d", session.info.captureWidth, session.info.captureHeight),
-        "-framerate", tostring(options.fps), "-i", "pipe:0")
-    else
-      local lines = {"ffconcat version 1.0\n"}
-      local frameRate = "\noption framerate " .. options.fps .. "\n"
-      for _, id in ipairs(frames) do
-        local source = store.png(session, id):gsub("\\", "/"):gsub("'", "'\\''")
-        lines[#lines + 1] = "file '" .. source .. "'" .. frameRate
-      end
-      store.writeText(manifest, table.concat(lines))
-      add("-f", "concat", "-safe", "0", "-protocol_whitelist", "file", "-i", manifest)
-    end
+    add("-f", "rawvideo", "-pixel_format", "rgba", "-video_size",
+      string.format("%dx%d", session.info.captureWidth, session.info.captureHeight),
+      "-framerate", tostring(options.fps), "-i", "pipe:0")
 
     -- Use one timestamp per selected frame, including repeated Undo/Redo images.
     local filters = string.format(
@@ -187,9 +193,15 @@ local function encode(store, session, frames, folder, geometry, options)
     end
     add(pending)
     local success, code = runHelper(store, "export", {
-      executable=options.ffmpeg, arguments=args, log=log, sources=sources,
-      frameBytes=session.info.rowStride and session.info.rowStride * session.info.captureHeight
-    })
+      executable=options.ffmpeg, arguments=args, log=log, stream=true
+    },function(pipe)
+      for _,id in ipairs(frames) do
+        local image=store.loadSnapshot(session,id)
+        assert(image.width==session.info.captureWidth and image.height==session.info.captureHeight,
+          "Edited frame dimensions differ from the output canvas.")
+        assert(pipe:write(image.bytes))
+      end
+    end)
     assert(success, string.format("FFmpeg failed (%s). Log: %s", tostring(code), log))
     assert(fs.isFile(pending) and fs.fileSize(pending) > 0, "No video produced. Log: " .. log)
     store.move(pending, output)
@@ -200,7 +212,6 @@ local function encode(store, session, frames, folder, geometry, options)
       print("AseLaps: temporary export data could not be removed: " .. path)
     end
   end
-  remove(manifest)
   if not ok then
     remove(pending)
     error(err, 0)
@@ -212,17 +223,16 @@ local function sample(frames, step)
   if step == 1 then return frames end
   local result = {}
   for i = 1, #frames, step do result[#result + 1] = frames[i] end
-  if (#frames - 1) % step ~= 0 then result[#result + 1] = frames[#frames] end
   return result
 end
 
 function Export.run(store, session, input)
-  assert(session.info.version ~= 2 or input.mode == "Full", "Sampled sessions support Full history only.")
+  assert(session.info.version == 1 or input.mode == "Full", "Sampled sessions support Full history only.")
   local options = {
-    format=input.format, background=input.background, ratio=input.ratio,
+    format=input.format, background=input.background, ratio=input.ratio, sequencePrefix=input.sequencePrefix,
     scale=input.scale, ffmpeg=input.ffmpeg, fps=integer(input.fps, 1, 60, "FPS")
   }
-  local step = integer(input.step or (session.info.version == 2 and 1 or Export.defaultStep), 1, 1000, "Frame interval")
+  local step = integer(input.step or Export.defaultStep, 1, 1000, "Frame interval")
   assert(options.format == "MP4" or options.format == "GIF" or options.format == "PNG sequence",
     "Select an output format.")
   local hold = tonumber(input.hold)
@@ -239,24 +249,50 @@ function Export.run(store, session, input)
   local sequences = {}
   for _, mode in ipairs(modes) do
     assert(mode == "Full" or mode == "Clean", "Select a history mode.")
-    local frames, reason = session.history:timeline(mode, input.head)
-    assert(frames, reason)
-    assert(#frames > 0, "There are no captured frames in " .. mode .. " History.")
-    sequences[mode] = sample(frames, step)
+    if input.sequences and input.sequences[mode] then
+      sequences[mode]=input.sequences[mode]
+    else
+      local frames,missing=store.timeline(session,mode,input.head)
+      assert(#missing==0 or input.skipMissing,"Missing frames found. Review and confirm skipping them.")
+      sequences[mode]=sample(frames,step)
+    end
+    assert(#sequences[mode]>0,"There are no output frames in "..mode.." History.")
   end
-  local destination = input.folder
+  local destination = input.folder or (input.output and fs.filePath(input.output))
   if destination == "" then destination = join(session.project.folder, "exports") end
   assert(Export.isAbsolute(destination), "Enter an absolute Windows output folder.")
   local outputs = {}
   for _, mode in ipairs(modes) do
-    local folder = store.numberedDirectory(destination, "AseLaps_" .. mode .. "_" .. session.name)
+    local folder
+    if input.sequenceFolder then
+      folder=input.sequenceFolder
+      if #modes>1 then folder=folder .. "_" .. mode end
+      assert(not fs.isDirectory(folder),"PNG sequence folder already exists.")
+      store.ensureDirectory(folder)
+    else folder = store.numberedDirectory(destination, "AseLaps_" .. mode .. "_" .. session.name) end
     if options.format == "PNG sequence" then
       outputs[#outputs + 1] = pngSequence(store, session, sequences[mode], folder, geometry, options)
     else
-      outputs[#outputs + 1] = encode(store, session, sequences[mode], folder, geometry, options)
+      local encoded = encode(store, session, sequences[mode], folder, geometry, options)
+      if input.output then
+        local target = input.output
+        if #modes > 1 then target = target:gsub("(%.[^.]+)$", "_" .. mode .. "%1") end
+        if fs.isFile(target) then
+          assert(input.overwrite, "Output already exists.")
+          -- Keep the previous video until encoding has completed successfully.
+          local backup = target .. ".backup-" .. os.time()
+          assert(not fs.isFile(backup), "Output backup already exists.")
+          store.move(target, backup)
+          local moved, message = pcall(store.move, encoded, target)
+          if not moved then store.move(backup, target); error(message) end
+          assert(store.remove(backup))
+        else store.move(encoded,target) end
+        outputs[#outputs+1] = target
+      else outputs[#outputs+1] = encoded end
     end
   end
   return outputs
 end
 
+Export.sample = sample
 return Export

@@ -1,9 +1,11 @@
 local fs = app.fs
 local join = fs.joinPath
+local Codec = dofile(join(fs.filePath(debug.getinfo(1,"S").source:sub(2)), "codec.lua"))
 local Store = {}
 Store.__index = Store
 
 local function write(path, bytes, mode)
+  Store.assertLocalPath(path)
   local file = assert(io.open(path, mode))
   local written, writeError = file:write(bytes)
   local closed, closeError = file:close()
@@ -17,6 +19,11 @@ local function plainObject(object)
     if type(value) == "userdata" then value = plainObject(value) end
     if type(value) == "number" then value = math.tointeger(value) or value end
     result[key] = value
+  end
+  for index, value in ipairs(object) do
+    if type(value) == "userdata" or type(value) == "table" then value = plainObject(value) end
+    if type(value) == "number" then value = math.tointeger(value) or value end
+    result[index] = value
   end
   return result
 end
@@ -44,6 +51,7 @@ local function writeNewJson(path, data)
 end
 
 local function ensureDirectory(path)
+  Store.assertLocalPath(path)
   assert(fs.isDirectory(path) or fs.makeAllDirectories(path), "Cannot create folder: " .. path)
 end
 
@@ -66,6 +74,24 @@ local function numberedDirectory(root, prefix)
       return path
     end
     suffix = suffix + 1
+  end
+end
+
+function Store.recordingRoot()
+  return join(assert(os.getenv("USERPROFILE")), "Downloads", "IncreParty_Illust")
+end
+
+function Store.assertLocalPath(path)
+  local normalized = fs.normalizePath(path):gsub("\\", "/"):lower():gsub("/+$", "")
+  local roots = {join(assert(os.getenv("USERPROFILE")), "OneDrive")}
+  for _, name in ipairs({"OneDrive", "OneDriveConsumer", "OneDriveCommercial"}) do
+    local value = os.getenv(name)
+    if value and value ~= "" then roots[#roots+1] = value end
+  end
+  for _, root in ipairs(roots) do
+    root = fs.normalizePath(root):gsub("\\", "/"):lower():gsub("/+$", "")
+    assert(normalized ~= root and normalized:sub(1,#root+1) ~= root .. "/",
+      "OneDrive storage is disabled. Choose a folder outside OneDrive.")
   end
 end
 
@@ -95,20 +121,13 @@ end
 
 function Store:project(sprite, create)
   local source = Store.source(sprite)
-  if source then
-    for _, project in ipairs(self:projects()) do
-      if project.source == source then return project end
-    end
+  if not source then return nil end
+  local folder = join(Store.recordingRoot(), fs.fileTitle(sprite.filename) .. "__record")
+  local project = {folder=folder, title=fs.fileTitle(sprite.filename), source=source, standalone=true}
+  if fs.isDirectory(folder) or create then return project end
+  for _, legacy in ipairs(self:projects()) do
+    if legacy.source == source then return legacy end
   end
-  if not create then return nil end
-  local title = fs.fileTitle(sprite.filename)
-  if title == "" then title = "Untitled" end
-  local prefix = os.date("%Y%m%d_%H%M%S")
-  local folder = numberedDirectory(self.root, prefix)
-  local info = { version=1, title=title, source=source }
-  writeNewJson(join(folder, "project.json"), info)
-  info.folder = folder
-  return info
 end
 
 function Store:bind(project, source)
@@ -119,8 +138,8 @@ end
 
 function Store:sessions(project)
   local result = {}
-  for _, name in ipairs(entries(join(project.folder, "sessions"))) do
-    local path = join(project.folder, "sessions", name, "session.json")
+  for _, name in ipairs(entries(project.standalone and project.folder or join(project.folder, "sessions"))) do
+    local path = join(project.standalone and project.folder or join(project.folder, "sessions"), name, "session.json")
     if fs.isFile(path) then
       result[#result + 1] = {
         folder=fs.filePath(path), project=project, name=name, info=readJson(path)
@@ -131,7 +150,15 @@ function Store:sessions(project)
 end
 
 function Store:create(project, info)
-  local folder = numberedDirectory(join(project.folder, "sessions"), os.date("%Y%m%d_%H%M%S"))
+  local folder = info.folder
+  if folder then
+    assert(not fs.isDirectory(folder) and not fs.isFile(folder), "Choose a new session name.")
+    ensureDirectory(folder)
+  else
+    folder = numberedDirectory(project.standalone and project.folder or join(project.folder, "sessions"), os.date("%Y%m%d_%H%M%S"))
+  end
+  info.folder = nil
+  info.title, info.source = project.title, project.source
   ensureDirectory(join(folder, "snapshots"))
   info.version = info.version or 1
   writeNewJson(join(folder, "session.json"), info)
@@ -146,7 +173,82 @@ function Store.loadImage(path)
   return assert(Image{ fromFile=path }, "Cannot load PNG: " .. path)
 end
 
+local function packPath(session, generation)
+  if not generation or generation==0 then return join(session.folder,"frames.pack") end
+  return join(session.folder,string.format("frames.%06d.pack",generation))
+end
+
+function Store.loadNative(session,id)
+  if session.info.version~=4 or type(id)=="string" then return Store.loadSnapshot(session,id) end
+  local target=assert(session.records[id],"Missing frame.")
+  local cache=session.reader
+  local start=target.base
+  local rows
+  if cache and cache.id>=start and cache.id<=id then start,rows=cache.id+1,cache.rows end
+  if start<=id then
+    local file <close> = assert(io.open(packPath(session,target.generation),"rb"))
+    for n=start,id do rows=Codec.decode(file,assert(session.records[n]),rows) end
+  end
+  session.reader={id=id,rows=rows}
+  local image=Image(target.w,target.h,ColorMode.RGB)
+  image.bytes=table.concat(rows)
+  return image
+end
+
+function Store.offset(session,id)
+  local dx,dy=0,0
+  for _,b in ipairs(session.boundaries) do
+    if id<b.id then dx,dy=dx+b.dx,dy+b.dy end
+  end
+  local crop=session.info.crop
+  if crop and #session.boundaries==0 then dx,dy=dx-crop.x,dy-crop.y end
+  return dx,dy
+end
+
+local function indexRecord(session,event)
+  local r=event.record
+  local id=event.snapshot
+  session.records[id]=r
+  session.lastCapture=id
+  if event.boundary then
+    local b=event.boundary
+    b.id=id
+    session.boundaries[#session.boundaries+1]=b
+    session.info.captureWidth,session.info.captureHeight=r.w,r.h
+  end
+end
+
+function Store.setAlignment(session,id,dx,dy)
+  assert(math.tointeger(dx) and math.tointeger(dy),"Use whole pixel offsets.")
+  for _,b in ipairs(session.boundaries) do
+    if b.id==id then
+      Store.edit(session,{kind="alignment",id=id,dx=dx,dy=dy})
+      return
+    end
+  end
+  error("Unknown resize boundary.")
+end
+
 function Store.loadSnapshot(session, id)
+  if type(id)=="string" then
+    local edited=Store.loadImage(Store.snapshotPath(session,id))
+    local anchor=session.editAnchors and session.editAnchors[id]
+    if not anchor then return edited end
+    local x,y=0,0
+    for _,b in ipairs(session.boundaries) do
+      if b.id>anchor.id then x,y=x+b.dx,y+b.dy end
+    end
+    if anchor.crop and #session.boundaries>0 then x,y=x+anchor.crop.x,y+anchor.crop.y end
+    if x==0 and y==0 and edited.width==session.info.captureWidth and edited.height==session.info.captureHeight then return edited end
+    return Image(edited,Rectangle(-x,-y,session.info.captureWidth,session.info.captureHeight))
+  end
+  if session.info.version==4 then
+    local image=Store.loadNative(session,id)
+    local x,y=Store.offset(session,id)
+    local w,h=session.info.captureWidth,session.info.captureHeight
+    if x==0 and y==0 and image.width==w and image.height==h then return image end
+    return Image(image,Rectangle(-x,-y,w,h))
+  end
   if session.info.version == 2 then
     local image = Image(session.info.captureWidth, session.info.captureHeight, ColorMode.RGB)
     local bytes = read(Store.snapshotPath(session, id))
@@ -162,6 +264,7 @@ function Store.loadSnapshot(session, id)
 end
 
 function Store.writeImage(image, path)
+  Store.assertLocalPath(path)
   assert(image:saveAs(path) and fs.isFile(path), "Cannot write PNG: " .. path)
 end
 
@@ -174,6 +277,7 @@ function Store.writeText(path, text)
 end
 
 function Store.move(source, destination)
+  Store.assertLocalPath(destination)
   assert(os.rename(source, destination))
 end
 
@@ -183,12 +287,33 @@ function Store.remove(path)
 end
 
 function Store.snapshotPath(session, id)
-  if session.info.version == 1 then return Store.png(session, id) end
+  if type(id) == "string" then
+    assert(id:match("^edits/[%w_/-]+%.png$") and not id:find("..", 1, true), "Invalid edit path.")
+    return join(session.folder, id)
+  end
+  if session.info.version ~= 2 then return Store.png(session, id) end
   return join(session.folder, "snapshots", string.format("%06d.rgba", id))
 end
 
 function Store.saveSnapshot(session, image)
-  assert(session.info.version == 2, "New recordings require a sampled session.")
+  if session.info.version==4 then
+    local id=session.nextPng
+    local last=session.records[session.lastCapture]
+    local force=not last or id-last.base>=120
+    local data,ref=Codec.encode(session,image,force)
+    Store.assertLocalPath(session.pack)
+    local file = assert(io.open(session.pack,"ab"))
+    local offset=assert(file:seek("end"))
+    local written,writeError=file:write(data)
+    local closed,closeError=file:close()
+    assert(written,writeError)
+    assert(closed,closeError)
+    session.pending={generation=session.generation>0 and session.generation or nil,offset=offset,length=#data,w=image.width,h=image.height,ref=ref,base=ref and id or last.base}
+    session.nextPng=id+1
+    return id
+  end
+  if session.info.version == 3 then return Store.savePng(session, image) end
+  assert(session.info.version == 2, "Unsupported recording format.")
   assert(image.rowStride == session.info.rowStride, "Unexpected RGBA row stride.")
   local id = session.nextPng
   session.nextPng = id + 1
@@ -204,6 +329,7 @@ local function completePng(session, id)
   if session.info.version == 2 then
     return fs.fileSize(Store.snapshotPath(session, id)) == session.info.rowStride * session.info.captureHeight
   end
+  if not fs.isFile(Store.png(session, id)) then return false end
   local file = assert(io.open(Store.png(session, id), "rb"))
   local header = file:read(24)
   local ending = file:seek("end", -12) and file:read(12)
@@ -217,9 +343,9 @@ end
 function Store:load(descriptor)
   local session = {
     folder=descriptor.folder, project=descriptor.project, name=descriptor.name,
-    info=descriptor.info, nextPng=1, recovered=false
+    info=readJson(join(descriptor.folder,"session.json")), records={}, boundaries={}, pack=join(descriptor.folder,"frames.pack"), nextPng=1, recovered=false, missing={}, editOps={}, editRevision=0
   }
-  assert(session.info.version == 1 or session.info.version == 2, "Unsupported AseLaps session format.")
+  assert(session.info.version == 1 or session.info.version == 2 or session.info.version == 3 or session.info.version == 4, "Unsupported AseLaps session format.")
   if session.info.version == 2 then
     assert(session.info.captureMode == "sampled" and session.info.rowStride == session.info.captureWidth*4
       and (session.info.intervalMs == 500 or session.info.intervalMs == 1000 or session.info.intervalMs == 2000),
@@ -231,7 +357,7 @@ function Store:load(descriptor)
     local id = tonumber(name:match(session.info.version == 2 and "^(%d+)%.rgba$" or "^(%d+)%.png$"))
     local pending = tonumber(name:match(session.info.version == 2 and "^(%d+)%.rgba%.pending$" or "^(%d+)%.pending%.png$"))
     if id or pending then session.nextPng = math.max(session.nextPng, (id or pending) + 1) end
-    if id then snapshots[id] = session.info.version == 1 or completePng(session, id) end
+    if id then snapshots[id] = completePng(session, id) end
     if pending then hasPending = true end
   end
 
@@ -250,6 +376,18 @@ function Store:load(descriptor)
     end
   end
   table.sort(journals, function(a, b) return a.number < b.number end)
+  local packSizes={}
+  local function completeRecord(record)
+    if not record then return false end
+    local generation=record.generation or 0
+    local size=packSizes[generation]
+    if size==nil then
+      local path=packPath(session,generation)
+      size=fs.isFile(path) and fs.fileSize(path) or -1
+      packSizes[generation]=size
+    end
+    return record.offset>=0 and record.length>=0 and record.offset+record.length<=size
+  end
   local function replay()
     session.history = self.history.new()
     local damaged, lastPng = false, 0
@@ -259,15 +397,20 @@ function Store:load(descriptor)
       for line in file:lines("L") do
         local decoded, event = pcall(decode, line)
         local png = decoded and math.tointeger(event.snapshot or event.png)
-        if png then session.nextPng = math.max(session.nextPng, png + 1) end
+        if png and session.info.version~=4 then session.nextPng = math.max(session.nextPng, png + 1) end
         if not damaged then
           if line:sub(-1) ~= "\n" or not decoded or not session.history:accepts(event)
-            or (png and not snapshots[png]) then
+            or (png and session.info.version==4 and not completeRecord(event.record))
+            then
             damaged = true
             session.recovered = true
           else
             session.history:apply(event)
-            if png then lastPng = math.max(lastPng, png) end
+            if png and session.info.version==4 then
+              indexRecord(session,event)
+              session.nextPng=png+1
+            elseif png and not snapshots[png] then session.missing[png] = true end
+            if png and snapshots[png] then lastPng = math.max(lastPng, png) end
           end
         end
       end
@@ -288,6 +431,8 @@ function Store:load(descriptor)
   if damaged then generation = generation + 1 end
   local name = generation == 0 and "events.jsonl" or string.format("events.%06d.jsonl", generation)
   session.journal = join(session.folder, name)
+  session.generation=generation
+  session.pack=packPath(session,generation)
 
   session.orphans = {}
   for id, valid in pairs(snapshots) do
@@ -296,6 +441,7 @@ function Store:load(descriptor)
     end
   end
   table.sort(session.orphans)
+  Store.loadEdits(session)
   return session
 end
 
@@ -314,12 +460,145 @@ end
 function Store.append(session, event)
   assert(not session.faulted, "Reopen the session after the storage error before writing.")
   event.id = #session.history.events + 1
-  event.time = os.time()
+  event.time = event.time or os.time()
   assert(session.history:accepts(event), "Invalid AseLaps history event.")
+  if session.info.version==4 and event.snapshot then
+    event.record=assert(session.pending,"Missing frame data.")
+  end
   write(session.journal, json.encode(event) .. "\n", "ab")
   session.history:apply(event)
+  if session.info.version==4 and event.record then indexRecord(session,event); session.pending=nil end
 end
 
+function Store:open(path)
+  assert(fs.fileName(path):lower() == "session.json", "Select session.json.")
+  local folder = fs.filePath(path)
+  local info = readJson(path)
+  local project = {title=info.title or fs.fileName(folder), source=info.source, folder=fs.filePath(folder), standalone=true}
+  if not info.title then
+    local legacy = join(fs.filePath(fs.filePath(folder)), "project.json")
+    if fs.isFile(legacy) then
+      project = readJson(legacy)
+      project.folder = fs.filePath(fs.filePath(folder))
+    end
+  end
+  return self:load{folder=folder, project=project, info=info, name=fs.fileName(folder)}
+end
+
+local applyAlignments
+function Store.loadEdits(session)
+  local path = join(session.folder, "edits.jsonl")
+  session.editOps, session.editRevision = {}, 0
+  for _,b in ipairs(session.boundaries or {}) do
+    if not b.original then b.original={b.dx,b.dy,b.uncertain} end
+    b.dx,b.dy,b.uncertain=table.unpack(b.original)
+  end
+  if not fs.isFile(path) then return end
+  for line in read(path):gmatch("[^\n]+\n") do
+    local ok, event = pcall(decode, line)
+    if not ok then error("Damaged edit history: " .. path) end
+    session.editRevision = session.editRevision + 1
+    if event.kind == "undo" then table.remove(session.editOps)
+    else session.editOps[#session.editOps+1] = event end
+  end
+  applyAlignments(session)
+end
+
+applyAlignments=function(session)
+  session.editAnchors={}
+  for _,op in ipairs(session.editOps) do
+    if op.kind=="replace" and op.anchor then
+      for _,id in ipairs(op.frames) do session.editAnchors[id]=op.anchor end
+    elseif op.kind=="alignment" then
+      for _,b in ipairs(session.boundaries) do
+        if b.id==op.id then b.dx,b.dy,b.uncertain=op.dx,op.dy,false end
+      end
+    end
+  end
+end
+
+function Store.edit(session, operation)
+  if session.info.version==4 and operation.kind=="replace" then
+    operation.anchor={id=session.lastCapture,crop=#session.boundaries==0 and session.info.crop or nil}
+  end
+  local path = join(session.folder, "edits.jsonl")
+  if fs.isFile(path) then
+    local bytes = read(path)
+    assert(bytes == "" or bytes:sub(-1) == "\n", "Incomplete edit journal. Restore the last complete line before editing.")
+  end
+  write(path, json.encode(operation) .. "\n", "ab")
+  Store.loadEdits(session)
+end
+
+function Store.timeline(session, mode, head, includeExcluded, includeMissing)
+  local base, reason = session.history:timeline(mode or "Full", head)
+  assert(base, reason)
+  local frames = {}
+  for _, id in ipairs(base) do frames[#frames+1] = id end
+  local excluded = {}
+  for _, operation in ipairs(session.editOps or {}) do
+    if operation.kind == "exclude" then
+      for _, id in ipairs(operation.ids) do excluded[tostring(id)] = operation.value end
+    elseif operation.kind == "replace" then
+      local first, last
+      for i, id in ipairs(frames) do
+        if tostring(id) == tostring(operation.first) then first = i end
+        if tostring(id) == tostring(operation.last) then last = i end
+      end
+      if first and last and first <= last then
+        local result = {}
+        for i=1,first-1 do result[#result+1] = frames[i] end
+        for _, id in ipairs(operation.frames) do result[#result+1] = id end
+        for i=last+1,#frames do result[#result+1] = frames[i] end
+        frames = result
+      end
+    end
+  end
+  local result, missing = {}, {}
+  for _, id in ipairs(frames) do
+    if includeExcluded or not excluded[tostring(id)] then
+      if session.missing[id] or (type(id)=="number" and session.info.version==4 and not session.records[id]) or (type(id)=="string" and not fs.isFile(Store.snapshotPath(session,id))) then
+        missing[#missing+1] = id
+        if includeMissing then result[#result+1] = id end
+      else result[#result+1] = id end
+    end
+  end
+  return result, missing
+end
+
+function Store:convert(session, parent)
+  local info = {}
+  for key,value in pairs(session.info) do info[key] = value end
+  info.version, info.captureMode, info.intervalMs = 3, "sampled", info.intervalMs or 500
+  info.folder = numberedDirectory(parent, "PNG_copy_" .. session.name)
+  -- create() owns creation of the session directory.
+  assert(fs.removeDirectory(info.folder))
+  local converted = self:create(session.project, info)
+  for _, event in ipairs(session.history.events) do
+    local copy = {}
+    for key,value in pairs(event) do copy[key] = value end
+    local id = event.snapshot or event.png
+    if id and not session.missing[id] and not fs.isFile(Store.png(converted,id)) then
+      Store.writeImage(Store.loadSnapshot(session,id), Store.png(converted,id))
+      assert(Store.loadSnapshot(converted,id):isEqual(Store.loadSnapshot(session,id)), "PNG verification failed.")
+    end
+    copy.record,copy.boundary=nil,nil
+    Store.append(converted,copy)
+  end
+  for _, operation in ipairs(session.editOps) do
+    if operation.kind == "replace" then
+      for _, id in ipairs(operation.frames) do
+        local target = Store.snapshotPath(converted,id)
+        ensureDirectory(fs.filePath(target))
+        Store.copy(Store.snapshotPath(session,id),target)
+      end
+    end
+    Store.edit(converted,operation)
+  end
+  return self:load(converted)
+end
+
+Store.align = Codec.align
 Store.ensureDirectory = ensureDirectory
 Store.numberedDirectory = numberedDirectory
 Store.readText = read

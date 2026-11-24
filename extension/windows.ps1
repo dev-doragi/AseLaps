@@ -1,5 +1,5 @@
 param(
-    [Parameter(Mandatory)][ValidateSet('export', 'browse', 'open')][string]$Action,
+    [Parameter(Mandatory)][ValidateSet('export', 'browse', 'open', 'check')][string]$Action,
     [Parameter(Mandatory)][ValidatePattern('^AseLaps-[0-9]+_[0-9]+$')][string]$JobName
 )
 
@@ -8,18 +8,15 @@ $job = Join-Path ([IO.Path]::GetTempPath()) $JobName
 $request = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $job 'request.json') | ConvertFrom-Json
 
 switch ($Action) {
+    'check' {
+        & ([string]$request.executable) -version | Out-Null
+        exit $LASTEXITCODE
+    }
     'export' {
         $executable = [string]$request.executable
         $ffArgs = [string[]]$request.arguments
-        if ($request.sources) {
-            Add-Type -Path (Join-Path $PSScriptRoot 'RawEncoder.cs')
-            exit [AseLapsRawEncoder]::Run($executable, $ffArgs, [string[]]$request.sources,
-                [long]$request.frameBytes, [string]$request.log)
-        }
-        $ErrorActionPreference = 'Continue'
-        $global:LASTEXITCODE = 1
-        & $executable @ffArgs 2>&1 | Out-File -Encoding UTF8 -LiteralPath $request.log -ErrorAction Stop
-        exit $LASTEXITCODE
+        Add-Type -Path (Join-Path $PSScriptRoot 'RawEncoder.cs')
+        exit [AseLapsRawEncoder]::Run($executable, $ffArgs, [string]$request.log)
     }
     'browse' {
         Add-Type -Path (Join-Path $PSScriptRoot 'FolderPicker.cs')
