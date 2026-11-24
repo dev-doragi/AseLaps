@@ -55,7 +55,8 @@ assert(#eligible==count-1)
 S.edit(session,{kind="undo"});assert(#S.timeline(session,"Full")==count+1)
 local many={}
 for i=1,13777 do many[i]=i end
-assert(#E.sample(many,5)==2756)
+assert(#E.sample(many,5)==2757)
+assert(E.sample(many,5)[2757]==13777)
 if app.params.ffmpeg then
  local opts={mode="Full",format="MP4",background="White",ratio="",scale=1,fps=30,hold=0,step=2,folder=work,ffmpeg=app.params.ffmpeg}
  assert(not pcall(E.checkEncoder,store,"missing.exe"))

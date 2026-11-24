@@ -5,6 +5,10 @@ local H,S,R,E=module("history"),module("store"),module("recorder"),module("expor
 local U=module("ui")
 assert(U.version=="2.2.0-rc.1" or U.version=="@ASELAPS_VERSION@")
 assert(not E.isAbsolute('C:\\recordings\\C:\\art\\session.json'))
+local ending={}
+for i=1,19556 do ending[i]=i end
+local sampled=E.sample(ending,15)
+assert(sampled[#sampled]==19556 and sampled[#sampled-1]==19546)
 S.recordingRoot=function() return fs.joinPath(work,"recordings") end
 local store=S.new(fs.joinPath(work,"legacy"),H)
 local preferences={}

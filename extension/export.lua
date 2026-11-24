@@ -281,6 +281,9 @@ local function sample(frames, step)
   if step == 1 then return frames end
   local result = {}
   for i = 1, #frames, step do result[#result + 1] = frames[i] end
+  if #frames>0 and result[#result]~=frames[#frames] then
+    result[#result+1]=frames[#frames]
+  end
   return result
 end
 
