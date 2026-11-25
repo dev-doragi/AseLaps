@@ -33,15 +33,19 @@ if app.params.ffmpeg then
   local options={mode="Full",format="MP4",background="White",ratio="",scale=1,fps=30,hold=0,step=10,
     ffmpeg=app.params.ffmpeg,folder=destination,output=fs.joinPath(destination,"long.mp4"),control={}}
   local task=coroutine.create(function() return E.run(store,session,options) end)
-  local yields=0
+  local yields, sawEncoder=0,false
   started=os.time()
   repeat
     local ok,value=coroutine.resume(task)
     assert(ok,value)
     yields=yields+1
+    if type(value)=="table" then
+      assert(value.phase~="Preparing video frames","Native V4 export must not stage RGBA")
+      if value.phase=="Encoding" then sawEncoder=true end
+    end
     assert(os.time()-started<90,"Long export timed out")
   until coroutine.status(task)=="dead"
-  assert(yields>1000 and fs.fileSize(options.output)>0)
+  assert(yields>0 and sawEncoder and fs.fileSize(options.output)>0)
   print("STRESS_VIDEO",options.output,1001,64,64,30)
   -- Cancellation after the worker has started must preserve the old output.
   options.overwrite=true

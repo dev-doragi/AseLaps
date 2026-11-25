@@ -41,18 +41,21 @@ function Recorder:start(doc, crop, initial, folder)
       and crop.x+crop.w <= sprite.width and crop.y+crop.h <= sprite.height,
       "The capture area must fit inside the canvas.")
   end
-  local interval = self.preferences.intervalMs or 500
+  local mode=self.preferences.captureMode or "Balanced"
+  local interval = mode=="Low impact" and 2000 or self.preferences.intervalMs or 500
   assert(interval == 500 or interval == 1000 or interval == 2000, "Invalid capture interval.")
   assert(sprite.hasAssociatedFile, "Save the artwork as .aseprite before recording.")
   doc.project = self.store:project(sprite, true)
   doc.session = self.store:create(doc.project, {
-    version=4, folder=folder, captureMode="sampled", intervalMs=interval, width=sprite.width, height=sprite.height,
+    version=4, folder=folder, captureMode="sampled", capturePolicy=mode, intervalMs=interval, width=sprite.width, height=sprite.height,
     captureWidth=crop and crop.w or sprite.width, captureHeight=crop and crop.h or sprite.height,
     rowStride=(crop and crop.w or sprite.width)*4, crop=crop, initial=initial ~= false})
   self.preferences.sessionsBySource = self.preferences.sessionsBySource or {}
   self.preferences.sessionsBySource[self.store.source(sprite):gsub("\\","/")] = app.fs.normalizePath(app.fs.joinPath(doc.session.folder,"session.json"))
   doc.elapsedBase, doc.started, doc.running = 0, os.time(), true
-  doc.view, doc.dirty, doc.nextCapture = nil, false, self.clock+interval
+  doc.view,doc.dirty=nil,false
+  doc.lastSample,doc.pendingChanges=self.clock,0
+  doc.nextCapture=self.clock+(mode=="Smart Sampling" and 2000 or interval)
   self:append(doc, {kind="status", status="recording", source=self.store.source(doc.sprite)})
   if initial ~= false then self:sample(doc, true) end
 end
@@ -67,7 +70,10 @@ function Recorder:resume(doc)
   if doc.session.faulted then doc.session = self.store:load(doc.session) end
   assert(doc.session.history.status ~= "stopped", "Start a new session after stopping.")
   doc.elapsedBase, doc.started, doc.running = doc.session.history.elapsed, os.time(), true
-  doc.view, doc.dirty, doc.nextCapture = nil, true, self.clock+doc.session.info.intervalMs
+  doc.view,doc.dirty=nil,true
+  doc.lastSample,doc.pendingChanges=self.clock,0
+  local info=doc.session.info
+  doc.nextCapture=self.clock+(info.capturePolicy=="Smart Sampling" and 2000 or info.intervalMs)
   self:append(doc, {kind="status", status="recording", source=self.store.source(doc.sprite)})
   doc.project.source=self.store.source(doc.sprite)
   self.preferences.sessionsBySource=self.preferences.sessionsBySource or {}
@@ -98,6 +104,13 @@ function Recorder:sample(doc, manual)
   frame=math.min(frame,#doc.sprite.frames)
   local image = render(doc.sprite, frame, info.version==4 and {} or info)
   local previous = doc.view
+  if not previous and info.version==4 and doc.session.lastCapture then
+    local last=doc.session.records[doc.session.lastCapture]
+    local events=doc.session.history.events
+    local lastFrame=frame
+    for i=#events,1,-1 do if events[i].snapshot then lastFrame=events[i].frame or frame; break end end
+    if last and last.w==image.width and last.h==image.height then previous={frame=lastFrame,image=self.store.loadNative(doc.session,doc.session.lastCapture)} end
+  end
   if not previous or previous.frame ~= frame or not previous.image:isEqual(image) then
     local boundary
     if info.version==4 then
@@ -118,7 +131,8 @@ function Recorder:sample(doc, manual)
       boundary=boundary,label=manual and "Snapshot" or "Sample", snapshot=id, frame=frame, emit=true})
   end
   doc.view, doc.dirty = {frame=frame, image=image}, false
-  doc.nextCapture = self.clock+info.intervalMs
+  doc.lastSample,doc.pendingChanges=self.clock,0
+  doc.nextCapture = self.clock+(info.capturePolicy=="Smart Sampling" and 2000 or info.intervalMs)
 end
 function Recorder:capture(doc, fromUndo, manual)
   if not doc.running then return end
@@ -126,6 +140,15 @@ function Recorder:capture(doc, fromUndo, manual)
   doc.dirty = true
   if app.sprite==doc.sprite and app.frame then doc.frame=app.frame.frameNumber end
   local session=doc.session
+  if session.info.capturePolicy=="Smart Sampling" then
+    doc.pendingChanges=(doc.pendingChanges or 0)+1
+    local interval=doc.pendingChanges>=6 and 500 or doc.pendingChanges>=3 and 1000 or 2000
+    doc.nextCapture=math.min(doc.nextCapture,(doc.lastSample or self.clock)+interval)
+  end
+  if session.info.capturePolicy=="Every edit" and app.sprite==doc.sprite then
+    self:guard(doc,function() self:sample(doc,false) end)
+    return
+  end
   if session.info.version==4 and app.sprite==doc.sprite then
     local last=session.records[session.lastCapture]
     if doc.sprite.width~=(last and last.w or session.info.width)
@@ -225,6 +248,10 @@ function Recorder:tick(milliseconds)
   end
   self:guard(doc, function()
     if doc.filename ~= sprite.filename then self:renamed(doc) end
+    if self.preferences.autoRecord and sprite.hasAssociatedFile and not doc.session and not doc.autoAttempted then
+      doc.autoAttempted=true
+      self:start(doc,self.preferences.crop,self.preferences.initial)
+    end
     if doc.running and doc.dirty and self.clock >= doc.nextCapture then self:sample(doc, false) end
   end)
 end

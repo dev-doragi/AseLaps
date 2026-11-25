@@ -22,13 +22,37 @@ local function encodeSpan(row, first, last)
   if literal<=last then chunks[#chunks+1]=string.pack("<i2",(last-literal+1)//4)..row:sub(literal,last) end
   return table.concat(chunks)
 end
+local function packedSpan(row, a, b, y, width)
+  local encoded=encodeSpan(row,a,b)
+  return string.pack("<I4I4",y*width+(a-1)//4,#encoded)..encoded
+end
 local function span(row, before, y, width)
   if row==before then return "" end
   local a,b=1,#row
+  while a+63<=b and row:sub(a,a+63)==before:sub(a,a+63) do a=a+64 end
   while row:sub(a,a+3)==before:sub(a,a+3) do a=a+4 end
+  while b-63>=a and row:sub(b-63,b)==before:sub(b-63,b) do b=b-64 end
   while row:sub(b-3,b)==before:sub(b-3,b) do b=b-4 end
-  local encoded=encodeSpan(row,a,b)
-  return string.pack("<I4I4",y*width+(a-1)//4,#encoded)..encoded
+  local single=packedSpan(row,a,b,y,width)
+  -- Widely separated changes on a detailed row otherwise copy the unchanged middle.
+  -- Only keep split spans if the actual encoded representation is smaller.
+  if b-a<128 or #single<64 then return single end
+  local parts,first,pos={},a,a+4
+  while pos+63<b do
+    if row:sub(pos,pos+63)==before:sub(pos,pos+63) then
+      local gap=pos
+      while gap>first and row:sub(gap-4,gap-1)==before:sub(gap-4,gap-1) do gap=gap-4 end
+      if gap>first then parts[#parts+1]=packedSpan(row,first,gap-1,y,width) end
+      pos=pos+64
+      while pos+63<b and row:sub(pos,pos+63)==before:sub(pos,pos+63) do pos=pos+64 end
+      while pos<b and row:sub(pos,pos+3)==before:sub(pos,pos+3) do pos=pos+4 end
+      first=pos
+    else pos=pos+64 end
+  end
+  if #parts==0 then return single end
+  if first<=b then parts[#parts+1]=packedSpan(row,first,b,y,width) end
+  local split=table.concat(parts)
+  return #split<#single and split or single
 end
 function Codec.encode(session,image,force)
   local w,h=image.width,image.height

@@ -22,7 +22,7 @@ function init(plugin)
   local Ui = load("ui")
   local prefs=plugin.preferences
   if not prefs.recordingFolder and (prefs.sessionsBySource or prefs.lastRecordingFolder) then
-    prefs.recordingFolder=prefs.lastRecordingFolder or fs.joinPath(os.getenv("USERPROFILE"),"Downloads","IncreParty_Illust")
+    prefs.recordingFolder=prefs.lastRecordingFolder or Store.recordingRoot()
   end
   local store = Store.new(fs.joinPath(fs.userConfigPath, "AseLaps"), History,prefs)
   local warning
@@ -36,7 +36,8 @@ function init(plugin)
     recorder:tick()
     if warning then
       ui.notice, warning = warning, nil
-      app.alert{ title="AseLaps", text=ui.notice }
+      -- Non-modal; a hidden recorder is reopened only on failure.
+      if not ui.main then ui:show() end
     end
     ui:refresh()
   end }
@@ -45,6 +46,7 @@ end
 
 function exit()
   if timer then timer:stop() end
+  if ui and ui.studio then ui.studio:close() end
   if ui and ui.main then ui.main:close() end
   if recorder then recorder:shutdown() end
   recorder, timer, ui = nil, nil, nil

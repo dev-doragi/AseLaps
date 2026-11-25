@@ -30,10 +30,10 @@ r:tick(1000)
 S.saveSnapshot=saves
 assert(session.history.count==2)
 paint(3); r:status(doc,"paused"); assert(session.history.count==3)
-r:resume(doc); r:tick(500)
-paint(4); r:tick(5000); assert(session.history.count==5)
+r:resume(doc); r:tick(500); assert(session.history.count==3)
+paint(4); r:tick(5000); assert(session.history.count==4)
 local loaded=store:load(session)
-assert(loaded.history.count==5)
+assert(loaded.history.count==4)
 local options={mode="Full",format="PNG sequence",background="Transparent",ratio="",scale=1,fps=10,hold=0,folder=app.fs.joinPath(work,"export")}
 E.run(store,session,options)
 local legacy=store:create(doc.project,{width=16,height=16,captureWidth=16,captureHeight=16})
@@ -59,7 +59,7 @@ if app.params.ffmpeg then
 end
 local f=assert(io.open(session.journal,"ab")); f:write("partial"); f:close()
 local recovered=store:load(session)
-assert(recovered.recovered and #S.timeline(recovered,"Full")==5)
+assert(recovered.recovered and #S.timeline(recovered,"Full")==4)
 assert(#warnings==0,table.concat(warnings,"\n"))
 r:shutdown()
 print("ASELAPS_SAMPLED_OK")

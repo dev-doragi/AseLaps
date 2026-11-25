@@ -206,13 +206,37 @@ end
 function Store.offset(session,id)
   local crop=session.info.crop
   if crop then return -crop.x,-crop.y end
-  local dx,dy=0,0
-  for _,b in ipairs(session.boundaries) do
-    if id<b.id then dx,dy=dx+b.dx,dy+b.dy end
+  local boundaries=session.boundaries
+  local cache=session.offsetCache
+  if not cache or cache.count~=#boundaries or cache.revision~=session.editRevision then
+    cache={count=#boundaries,revision=session.editRevision,x={},y={}}
+    local x,y=0,0
+    for i=#boundaries,1,-1 do
+      x,y=x+boundaries[i].dx,y+boundaries[i].dy
+      cache.x[i],cache.y[i]=x,y
+    end
+    session.offsetCache=cache
   end
-  local crop=session.info.crop
-  if crop and #session.boundaries==0 then dx,dy=dx-crop.x,dy-crop.y end
-  return dx,dy
+  local lo,hi=1,#boundaries+1
+  while lo<hi do
+    local mid=(lo+hi)//2
+    if boundaries[mid].id<=id then lo=mid+1 else hi=mid end
+  end
+  return cache.x[lo] or 0,cache.y[lo] or 0
+end
+
+function Store.exportSnapshot(session)
+  local snapshot= {
+    folder=session.folder, name=session.name, project=session.project, pack=session.pack,
+    records=session.records, editAnchors=session.editAnchors,
+    editRevision=session.editRevision, info={}, boundaries={}
+  }
+  -- Existing records and pack bytes are immutable. Resize geometry can change as captures arrive.
+  for key,value in pairs(session.info) do snapshot.info[key]=value end
+  for i,boundary in ipairs(session.boundaries) do
+    snapshot.boundaries[i]={id=boundary.id,dx=boundary.dx,dy=boundary.dy}
+  end
+  return snapshot
 end
 
 local function indexRecord(session,event)
@@ -501,6 +525,7 @@ end
 
 local applyAlignments
 function Store.loadEdits(session)
+  session.offsetCache=nil
   local path = join(session.folder, "edits.jsonl")
   session.editOps, session.editRevision = {}, 0
   for _,b in ipairs(session.boundaries or {}) do

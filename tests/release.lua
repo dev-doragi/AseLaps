@@ -3,7 +3,7 @@ local root,work=assert(app.params.root),assert(app.params.work)
 local function module(name) return dofile(fs.joinPath(root,"extension",name..".lua")) end
 local H,S,R,E=module("history"),module("store"),module("recorder"),module("export")
 local U=module("ui")
-assert(U.version=="2.2.0-rc.1" or U.version=="@ASELAPS_VERSION@")
+assert(U.version=="2.3.0-rc.1" or U.version=="@ASELAPS_VERSION@")
 assert(not E.isAbsolute('C:\\recordings\\C:\\art\\session.json'))
 local ending={}
 for i=1,19556 do ending[i]=i end

@@ -16,7 +16,7 @@ switch ($Action) {
     'worker' {
         try {
             Add-Type -Path (Join-Path $PSScriptRoot 'RawEncoder.cs')
-            [AseLapsRawEncoder]::RunJob([string]$request.executable, [string[]]$request.arguments, [string]$request.log, [string]$request.cancel, [string]$request.status)
+            [AseLapsRawEncoder]::RunJob([string]$request.executable, [string[]]$request.arguments, [string]$request.log, [string]$request.cancel, [string]$request.status, [string]$request.manifest, [string]$request.source)
         }
         catch {
             [IO.File]::WriteAllText([string]$request.log, ($_ | Out-String))
