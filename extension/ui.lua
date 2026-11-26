@@ -113,6 +113,7 @@ function Ui:refresh()
   local selected=session or (not doc and self.selected)
   local running=doc and doc.running
   local resumable=session and session.info.version>=2 and (session.faulted or session.history.status~="stopped")
+  local autoResume=resumable and not session.faulted and session.history.status=="recording" and self.preferences.autoResume~=false
   local function modify(id,key,value)
     local cache=id..key
     if self.labels[cache]~=value then
@@ -121,7 +122,7 @@ function Ui:refresh()
     end
   end
   modify("project","text",sprite and fs.fileName(sprite.filename) or "Open an artwork")
-  modify("status","text",(running and "REC" or session and session.faulted and "Storage error" or resumable and "Paused" or "Ready").."  |  "..duration(self.recorder.elapsed(doc)))
+  modify("status","text",(running and "REC" or session and session.faulted and "Storage error" or autoResume and "Resumes on edit" or resumable and "Paused" or "Ready").."  |  "..duration(self.recorder.elapsed(doc)))
   modify("count","text",string.format("%d captures",session and session.history.count or 0))
   modify("record","text",running and "Pause" or resumable and "Resume" or "Record")
   local icon=running and "record" or resumable and "pause" or "stop"
@@ -132,11 +133,11 @@ function Ui:refresh()
   modify("count","visible",not self.preferences.compact)
   modify("snapshot","visible",not self.preferences.compact)
   modify("project","visible",not self.preferences.compact)
-  modify("record","enabled",not not (doc and sprite.hasAssociatedFile))
+  modify("record","enabled",not not doc)
   modify("stop","enabled",not not resumable)
   modify("snapshot","enabled",not not running)
   modify("studio","enabled",not not selected)
-  modify("notice","text",self.notice or (sprite and not sprite.hasAssociatedFile and "Save your artwork first." or ""))
+  modify("notice","text",self.notice or (session and not sprite.hasAssociatedFile and "Save the artwork to resume this recording later." or ""))
 end
 
 function Ui:show()
@@ -204,7 +205,7 @@ function Ui:settings()
   dlg:label{text="Choose a local folder outside OneDrive. Existing sessions stay in place."}
   dlg:check{ id="initial", label="New sessions", text="Initial snapshot", selected=prefs.initial ~= false }
   dlg:check{ id="auto", label="On reopen", text="Resume recording", selected=prefs.autoResume ~= false }
-  dlg:check{id="autoRecord",label="New artwork",text="Record automatically",selected=prefs.autoRecord==true}
+  dlg:check{id="autoRecord",label="New artwork",text="Record automatically",selected=prefs.autoRecord~=false}
   dlg:combobox{id="captureMode",label="Recording mode",options={"Balanced","Every edit","Low impact","Smart Sampling"},option=prefs.captureMode or "Balanced"}
   local intervals = {[500]="0.5 seconds", [1000]="1 second", [2000]="2 seconds"}
   dlg:combobox{ id="interval", label="Capture while drawing", options={"0.5 seconds", "1 second", "2 seconds"},

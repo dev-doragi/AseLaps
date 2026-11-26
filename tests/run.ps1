@@ -12,7 +12,7 @@ $profile = Join-Path $work 'profile'
 New-Item -ItemType Directory -Force -Path $profile | Out-Null
 $Aseprite = (Get-Item -LiteralPath $Aseprite).FullName
 if ($FFmpeg) { $FFmpeg = (Get-Item -LiteralPath $FFmpeg).FullName }
-$cases = @('probe', 'sampled', 'v2', 'v4', 'release', 'stress')
+$cases = @('probe', 'sampled', 'v2', 'v4', 'autorecord', 'release', 'stress')
 foreach ($name in $cases) {
     $testFile = Join-Path $PSScriptRoot "$name.lua"
     if (-not (Test-Path -LiteralPath $testFile)) { throw "Missing test: $testFile" }

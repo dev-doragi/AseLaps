@@ -33,6 +33,12 @@ function Recorder:guard(doc, action)
   end
   return ok, result
 end
+function Recorder:remember(doc)
+  local key = self.store.pathKey(doc.project.source)
+  if not key then return end
+  self.preferences.sessionsBySource = self.preferences.sessionsBySource or {}
+  self.preferences.sessionsBySource[key] = app.fs.joinPath(doc.session.folder,"session.json")
+end
 function Recorder:start(doc, crop, initial, folder)
   assert(not doc.running, "Stop the current session first.")
   local sprite = doc.sprite
@@ -44,14 +50,13 @@ function Recorder:start(doc, crop, initial, folder)
   local mode=self.preferences.captureMode or "Balanced"
   local interval = mode=="Low impact" and 2000 or self.preferences.intervalMs or 500
   assert(interval == 500 or interval == 1000 or interval == 2000, "Invalid capture interval.")
-  assert(sprite.hasAssociatedFile, "Save the artwork as .aseprite before recording.")
   doc.project = self.store:project(sprite, true)
   doc.session = self.store:create(doc.project, {
     version=4, folder=folder, captureMode="sampled", capturePolicy=mode, intervalMs=interval, width=sprite.width, height=sprite.height,
     captureWidth=crop and crop.w or sprite.width, captureHeight=crop and crop.h or sprite.height,
     rowStride=(crop and crop.w or sprite.width)*4, crop=crop, initial=initial ~= false})
-  self.preferences.sessionsBySource = self.preferences.sessionsBySource or {}
-  self.preferences.sessionsBySource[self.store.source(sprite):gsub("\\","/")] = app.fs.normalizePath(app.fs.joinPath(doc.session.folder,"session.json"))
+  doc.project = doc.session.project
+  self:remember(doc)
   doc.elapsedBase, doc.started, doc.running = 0, os.time(), true
   doc.view,doc.dirty=nil,false
   doc.lastSample,doc.pendingChanges=self.clock,0
@@ -62,7 +67,7 @@ end
 function Recorder:resume(doc)
   assert(doc.session and not doc.running, "Select a paused session first.")
   self:canResume(doc,doc.session)
-  if doc.session.info.version < 3 then
+  if doc.session.info.version < 2 then
     local crop = doc.session.info.crop
     if crop and (crop.x+crop.w > doc.sprite.width or crop.y+crop.h > doc.sprite.height) then crop = nil end
     return self:start(doc, crop, true)
@@ -76,11 +81,10 @@ function Recorder:resume(doc)
   doc.nextCapture=self.clock+(info.capturePolicy=="Smart Sampling" and 2000 or info.intervalMs)
   self:append(doc, {kind="status", status="recording", source=self.store.source(doc.sprite)})
   doc.project.source=self.store.source(doc.sprite)
-  self.preferences.sessionsBySource=self.preferences.sessionsBySource or {}
-  self.preferences.sessionsBySource[self.store.pathKey(doc.project.source)]=app.fs.joinPath(doc.session.folder,"session.json")
+  self:remember(doc)
 end
 function Recorder:canResume(doc,session)
-  assert(doc.sprite.hasAssociatedFile,"Save the artwork before resuming.")
+  assert(doc.sprite.hasAssociatedFile or not session.project.source,"Open the original artwork before resuming.")
   assert(not session.exporting,"Wait for the current export to finish.")
   assert(session.history.status~="stopped","Start a new session after stopping.")
   for _,other in pairs(self.documents) do
@@ -168,20 +172,74 @@ function Recorder:status(doc, status)
   doc.running, doc.dirty, doc.view = false, false, nil
 end
 function Recorder:renamed(doc)
-  if not doc.project then return end
   local source = self.store.source(doc.sprite)
-  if not source then return end
-  if source ~= doc.project.source then
-    local target = self.store:project(doc.sprite, false)
-    if not doc.project.source and not target then self.store:bind(doc.project, source)
+  if source and self.store.pathKey(source) ~= self.store.pathKey(doc.project and doc.project.source) then
+    if doc.session and not doc.project.source then
+      self.store:bind(doc.session, source)
+      doc.project = doc.session.project
+      self:remember(doc)
     else
       local running, info = doc.running, doc.session and doc.session.info
       if running then self:status(doc, "stopped") end
-      doc.project, doc.session = target, nil
-      if running then self:start(doc, info.crop, info.initial) end
+      self:findSession(doc, source)
+      doc.autoAttempted = nil
+      if running and not doc.session then self:start(doc, info.crop, info.initial) end
     end
   end
   doc.filename = doc.sprite.filename
+end
+function Recorder:findSession(doc, source)
+  local key = self.store.pathKey(source)
+  local remembered=key and self.preferences.sessionsBySource and self.preferences.sessionsBySource[key]
+  if remembered and app.fs.isFile(remembered) then
+    local candidate=self.store:open(remembered)
+    if self.store.pathKey(candidate.project.source)==key then
+      doc.session,doc.project=candidate,candidate.project
+      return
+    end
+  end
+  doc.session,doc.project=nil,self.store:project(doc.sprite, false)
+  if not key then return end
+  local unsaved = {folder=app.fs.joinPath(self.store:recordingFolder(), "_Unsaved"), title="Untitled", standalone=true}
+  local latest
+  for _, project in ipairs({unsaved, doc.project}) do
+    for _, candidate in ipairs(self.store:sessions(project)) do
+      local knownSource=candidate.info.source or (not project.standalone and project.source)
+      if self.store.pathKey(knownSource or nil)==key and (not latest or candidate.name>latest.name) then
+        latest=candidate
+      end
+    end
+  end
+  if latest then
+    local loaded=self.store:load(latest)
+    if self.store.pathKey(loaded.project.source)==key then doc.session,doc.project=loaded,loaded.project end
+  end
+end
+function Recorder:changed(doc)
+  if self.busy then return end
+  local ok, sampled = self:guard(doc, function()
+    if doc.filename ~= doc.sprite.filename or (doc.session and not doc.project.source and doc.sprite.hasAssociatedFile) then
+      self:renamed(doc)
+    end
+    if doc.running or doc.autoAttempted then return end
+    if app.sprite==doc.sprite and app.frame then doc.frame=app.frame.frameNumber end
+    if doc.session then
+      if self.preferences.autoResume ~= false and doc.session.history.status == "recording" and not doc.session.exporting then
+        doc.autoAttempted=true
+        self:resume(doc)
+        self:sample(doc, false)
+        return true
+      end
+    elseif self.preferences.autoRecord ~= false then
+      doc.autoAttempted=true
+      local crop=self.preferences.crop
+      if crop and (crop.x+crop.w>doc.sprite.width or crop.y+crop.h>doc.sprite.height) then crop=nil end
+      self:start(doc,crop,self.preferences.initial)
+      if self.preferences.initial == false then self:sample(doc, false) end
+      return true
+    end
+  end)
+  if ok and not sampled then self:capture(doc) end
 end
 function Recorder:document(sprite)
   if self.documents[sprite.id] then return self.documents[sprite.id] end
@@ -189,43 +247,24 @@ function Recorder:document(sprite)
   local doc = {sprite=sprite, filename=sprite.filename, events=sprite.events, listeners={}}
   self.documents[sprite.id] = doc
   for _, name in ipairs({"change", "layervisibility", "layeropacity", "layerblendmode"}) do
-    doc.listeners[#doc.listeners+1] = sprite.events:on(name, function() self:capture(doc) end)
+    doc.listeners[#doc.listeners+1] = sprite.events:on(name, function() self:changed(doc) end)
   end
-  local source=self.store.source(sprite)
-  local remembered=source and self.preferences.sessionsBySource and (self.preferences.sessionsBySource[source:gsub("\\","/")] or self.preferences.sessionsBySource[source])
-  if remembered and app.fs.isFile(remembered) then
-    local candidate=self.store:open(remembered)
-    if self.store.pathKey(candidate.project.source)==self.store.pathKey(source) then
-      doc.session=candidate
-      doc.project=candidate.project
-    end
-  end
-  doc.project = doc.project or self.store:project(sprite, false)
-  if doc.project and not doc.session then
-    local sessions = self.store:sessions(doc.project)
-    for i=#sessions,1,-1 do
-      local candidate=sessions[i]
-      local knownSource=candidate.info.source
-      if not candidate.project.standalone then knownSource=knownSource or candidate.project.source end
-      if self.store.pathKey(knownSource)==self.store.pathKey(source) then
-        local loaded=self.store:load(candidate)
-        if self.store.pathKey(loaded.project.source)==self.store.pathKey(source) then
-          doc.session,doc.project=loaded,loaded.project
-          break
-        end
-      end
-    end
+  if not self:guard(doc, function() self:findSession(doc,self.store.source(sprite)) end) then
+    doc.autoAttempted=true
   end
   return doc
 end
 function Recorder:site()
+  if self.busy then return end
   for _,doc in pairs(self.documents) do
     if doc.running and doc.dirty and doc.sprite.isValid then
       self:guard(doc,function() self:flush(doc) end)
     end
   end
+  if app.sprite then self:document(app.sprite) end
 end
 function Recorder:tick(milliseconds)
+  if self.busy then return end
   self.clock = self.clock+(milliseconds or 250)
   for id, doc in pairs(self.documents) do
     if not doc.sprite.isValid then
@@ -235,30 +274,23 @@ function Recorder:tick(milliseconds)
       self.documents[id] = nil
     end
   end
-  local sprite = app.sprite
-  if not sprite then return end
-  local doc = self.documents[sprite.id]
-  if not doc then
-    local ok
-    ok, doc = self:guard(nil, function() return self:document(sprite) end)
-    if not ok or not doc then return end
-    if doc.session and doc.session.history.status == "recording" and self.preferences.autoResume ~= false then
-      self:guard(doc, function() self:resume(doc) end)
-    end
+  if app.sprite then self:document(app.sprite) end
+  for _,doc in pairs(self.documents) do
+    self:guard(doc, function()
+      if doc.filename ~= doc.sprite.filename or (doc.session and not doc.project.source and doc.sprite.hasAssociatedFile) then
+        self:renamed(doc)
+      end
+      if doc.running and doc.dirty and self.clock >= doc.nextCapture then self:sample(doc, false) end
+    end)
   end
-  self:guard(doc, function()
-    if doc.filename ~= sprite.filename then self:renamed(doc) end
-    if self.preferences.autoRecord and sprite.hasAssociatedFile and not doc.session and not doc.autoAttempted then
-      doc.autoAttempted=true
-      self:start(doc,self.preferences.crop,self.preferences.initial)
-    end
-    if doc.running and doc.dirty and self.clock >= doc.nextCapture then self:sample(doc, false) end
-  end)
 end
 function Recorder:watch()
   self.listeners[#self.listeners+1]=app.events:on("sitechange",function() self:site() end)
   self.listeners[#self.listeners+1]=app.events:on("beforecommand",function(ev)
-    if ev.name=="CloseFile" or ev.name=="CloseAllFiles" or ev.name=="Exit" then self:site() end
+    if ev.name=="CloseFile" or ev.name=="CloseAllFiles" or ev.name=="Exit" then self:tick(0); self:site() end
+  end)
+  self.listeners[#self.listeners+1]=app.events:on("aftercommand",function(ev)
+    if ev.name=="SaveFile" or ev.name=="SaveFileAs" then self:tick(0) end
   end)
   self:tick(0)
 end
@@ -267,6 +299,8 @@ function Recorder:shutdown()
   self.listeners={}
   for _, doc in pairs(self.documents) do
     self:guard(doc, function()
+      if doc.sprite.isValid and not self.store.pathKey(doc.project and doc.project.source)
+        and doc.session and doc.sprite.hasAssociatedFile then self:renamed(doc) end
       if doc.running then self:status(doc, "recording") end
       if doc.sprite.isValid then
         for _, id in ipairs(doc.listeners) do doc.events:off(id) end

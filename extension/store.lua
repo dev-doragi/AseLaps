@@ -129,19 +129,20 @@ end
 
 function Store:project(sprite, create)
   local source = Store.source(sprite)
-  if not source then return nil end
-  local folder = join(self:recordingFolder(), fs.fileTitle(sprite.filename) .. "__record")
-  local project = {folder=folder, title=fs.fileTitle(sprite.filename), source=source, standalone=true}
+  local title = source and fs.fileTitle(sprite.filename) or "Untitled"
+  local folder = join(self:recordingFolder(), source and (title .. "__record") or "_Unsaved")
+  local project = {folder=folder, title=title, source=source, standalone=true}
+  if not source then return create and project or nil end
   if fs.isDirectory(folder) or create then return project end
   for _, legacy in ipairs(self:projects()) do
     if legacy.source == source then return legacy end
   end
 end
 
-function Store:bind(project, source)
-  assert(not project.source and source, "Project already has a source document.")
-  writeNewJson(join(project.folder, "source.json"), { source=source })
-  project.source = source
+function Store:bind(session, source)
+  assert(not session.project.source and source, "Session already has a source document.")
+  writeNewJson(join(session.folder, "source.json"), { source=source })
+  session.info.source, session.project.source = source, source
 end
 
 function Store:sessions(project)
@@ -149,8 +150,11 @@ function Store:sessions(project)
   for _, name in ipairs(entries(project.standalone and project.folder or join(project.folder, "sessions"))) do
     local path = join(project.standalone and project.folder or join(project.folder, "sessions"), name, "session.json")
     if fs.isFile(path) then
+      local info = readJson(path)
+      local binding = join(fs.filePath(path), "source.json")
+      if fs.isFile(binding) then info.source = readJson(binding).source end
       result[#result + 1] = {
-        folder=fs.filePath(path), project=project, name=name, info=readJson(path)
+        folder=fs.filePath(path), project=project, name=name, info=info
       }
     end
   end
@@ -381,6 +385,8 @@ function Store:load(descriptor)
     folder=descriptor.folder, project=project, name=descriptor.name,
     info=readJson(join(descriptor.folder,"session.json")), records={}, boundaries={}, pack=join(descriptor.folder,"frames.pack"), nextPng=1, recovered=false, missing={}, editOps={}, editRevision=0
   }
+  local binding = join(session.folder,"source.json")
+  if fs.isFile(binding) then session.info.source=readJson(binding).source end
   if session.info.source then project.source=session.info.source end
   assert(session.info.version == 1 or session.info.version == 2 or session.info.version == 3 or session.info.version == 4, "Unsupported AseLaps session format.")
   if session.info.version == 2 then
