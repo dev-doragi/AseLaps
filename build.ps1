@@ -5,6 +5,12 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $source = Join-Path $PSScriptRoot 'extension'
 $package = Join-Path $PSScriptRoot 'AseLaps.aseprite-extension'
 $encoderFiles = @()
+if (-not $PSBoundParameters.ContainsKey('FFmpegDirectory')) {
+    $defaultEncoderDirectory = Join-Path $PSScriptRoot 'tools\ffmpeg'
+    if (Test-Path -LiteralPath (Join-Path $defaultEncoderDirectory 'ffmpeg.exe') -PathType Leaf) {
+        $FFmpegDirectory = $defaultEncoderDirectory
+    }
+}
 if ($FFmpegDirectory) {
     $encoder = Get-Item -LiteralPath (Join-Path $FFmpegDirectory 'ffmpeg.exe')
     if ($encoder.PSIsContainer) { throw 'FFmpegDirectory must contain ffmpeg.exe.' }
